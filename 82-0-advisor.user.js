@@ -1,0 +1,3214 @@
+// ==UserScript==
+// @name         82-0 Perfect Team Coach
+// @namespace    https://82-0.com/
+// @version      1.2.0
+// @description  Exact seeded draft planning, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
+// @author       Codex
+// @match        https://82-0.com/*
+// @match        https://www.82-0.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const VERSION = "1.2.0";
+  const MODEL_VERIFIED = "2026-07-15";
+  const PANEL_ID = "__82coach_host__";
+  const SITE_STYLE_ID = "__82coach_site_style__";
+  const DATA_URL = "/players_flat.json";
+  const DATA_CACHE_KEY = "nba_players_local_cache";
+  const UI_KEY = "__82coach_ui_v1__";
+  const MODE_KEY = "__82coach_mode_v1__";
+  const MISMATCH_KEY = "__82coach_model_mismatch_v1__";
+  const PICKS_KEY = "__82coach_picks_v1__";
+  const PICKS_MAX_AGE = 6 * 60 * 60 * 1000;
+
+  const POSITIONS = ["PG", "SG", "SF", "PF", "C"];
+  const POSITION_INDEX = Object.freeze({ PG: 0, SG: 1, SF: 2, PF: 3, C: 4 });
+  const FULL_POSITION_MASK = 0b11111;
+  const ERAS = new Set([
+    "1960s",
+    "1970s",
+    "1980s",
+    "1990s",
+    "2000s",
+    "2010s",
+    "2020s",
+  ]);
+  const TARGET_SCORE = 109.5;
+  const EPSILON = 1e-10;
+
+  // These are algebraically identical to the current production team formula.
+  const COEFF_PPG = (100 * 0.46) / 133.4;
+  const COEFF_RPG = (100 * 0.25) / 39.7;
+  const COEFF_APG = (100 * 0.18) / 29.3;
+  const COEFF_SPG = Array.from({ length: 6 }, (_, count) =>
+    count ? ((100 * 0.07) / 6.1) * (5 / count) : 0,
+  );
+  const COEFF_BPG = Array.from({ length: 6 }, (_, count) =>
+    count ? ((100 * 0.04) / 3.2) * (5 / count) : 0,
+  );
+
+  const COLORS = Object.freeze({
+    pick: "#22c55e",
+    team: "#f59e0b",
+    era: "#a855f7",
+    position: "#38bdf8",
+    impossible: "#ef4444",
+    muted: "#94a3b8",
+  });
+
+  function finiteNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : 0;
+  }
+
+  function positiveNumber(value) {
+    const number = finiteNumber(value);
+    return number > 0 ? number : 0;
+  }
+
+  function roundOne(value) {
+    return Math.round(value * 10) / 10;
+  }
+
+  function popcount(value) {
+    let count = 0;
+    for (let bits = value >>> 0; bits; bits &= bits - 1) count += 1;
+    return count;
+  }
+
+  function positionMask(positions) {
+    let mask = 0;
+    for (const position of positions || []) {
+      const index = POSITION_INDEX[position];
+      if (index !== undefined) mask |= 1 << index;
+    }
+    return mask;
+  }
+
+  function rawTeamScore(players) {
+    let ppg = 0;
+    let rpg = 0;
+    let apg = 0;
+    let spg = 0;
+    let bpg = 0;
+    let spgCount = 0;
+    let bpgCount = 0;
+
+    for (const player of players || []) {
+      ppg += finiteNumber(player.ppg);
+      rpg += finiteNumber(player.rpg);
+      apg += finiteNumber(player.apg);
+      const steals = positiveNumber(player.spg);
+      const blocks = positiveNumber(player.bpg);
+      if (steals > 0) {
+        spg += steals;
+        spgCount += 1;
+      }
+      if (blocks > 0) {
+        bpg += blocks;
+        bpgCount += 1;
+      }
+    }
+
+    const adjustedSpg = spgCount ? (spg * 5) / spgCount : 0;
+    const adjustedBpg = bpgCount ? (bpg * 5) / bpgCount : 0;
+    return (
+      100 *
+      ((0.46 * ppg) / 133.4 +
+        (0.25 * rpg) / 39.7 +
+        (0.18 * apg) / 29.3 +
+        (0.07 * adjustedSpg) / 6.1 +
+        (0.04 * adjustedBpg) / 3.2)
+    );
+  }
+
+  function projectedWins(score) {
+    return Math.round(
+      82 * Math.pow(Math.min(Math.max(score, 0) / 110, 1), 1.15),
+    );
+  }
+
+  function calculateTeamResult(players) {
+    const raw = rawTeamScore(players);
+    const score = roundOne(raw);
+    const wins = projectedWins(score);
+    return { raw, score, wins, losses: 82 - wins, possible82: wins === 82 };
+  }
+
+  function normalizeDataset(rawRows) {
+    const rows = [];
+    const nameToId = new Map();
+    const names = [];
+
+    for (const source of Array.isArray(rawRows) ? rawRows : []) {
+      if (!source || !ERAS.has(source.era) || !source.player || !source.team)
+        continue;
+      const positions = (
+        Array.isArray(source.positions) ? source.positions : [source.pos]
+      ).filter((position) => POSITION_INDEX[position] !== undefined);
+      const posMask = positionMask(positions);
+      if (!posMask) continue;
+
+      let nameId = nameToId.get(source.player);
+      if (nameId === undefined) {
+        nameId = names.length;
+        nameToId.set(source.player, nameId);
+        names.push(source.player);
+      }
+
+      const spg = positiveNumber(source.spg);
+      const bpg = positiveNumber(source.bpg);
+      rows.push({
+        player: String(source.player),
+        team: String(source.team),
+        era: String(source.era),
+        positions: [...new Set(positions)],
+        posMask,
+        ppg: finiteNumber(source.ppg),
+        rpg: finiteNumber(source.rpg),
+        apg: finiteNumber(source.apg),
+        spg,
+        bpg,
+        sig: (spg > 0 ? 1 : 0) | (bpg > 0 ? 2 : 0),
+        nameId,
+        id: source.id || `${source.player}_${source.team}_${source.era}`,
+        key: `${source.player}|${source.team}|${source.era}`,
+      });
+    }
+
+    return { rows, nameToId, names };
+  }
+
+  class ExactCeilingOptimizer {
+    constructor(rows, names) {
+      this.rows = rows;
+      this.names = names;
+      this.nameCount = names.length;
+      this.scenarios = [];
+      this.cache = new Map();
+      this.relevantNames = new Set();
+      this.buildIndex();
+    }
+
+    buildIndex() {
+      const actionCount = 20; // five positions x four defense-presence signatures
+      const denseValues = new Float64Array(this.nameCount * actionCount);
+      const denseRows = new Int32Array(this.nameCount * actionCount);
+
+      for (let ks = 0; ks <= 5; ks += 1) {
+        for (let kb = 0; kb <= 5; kb += 1) {
+          denseValues.fill(Number.NEGATIVE_INFINITY);
+          denseRows.fill(-1);
+
+          for (let rowIndex = 0; rowIndex < this.rows.length; rowIndex += 1) {
+            const row = this.rows[rowIndex];
+            const value =
+              COEFF_PPG * row.ppg +
+              COEFF_RPG * row.rpg +
+              COEFF_APG * row.apg +
+              COEFF_SPG[ks] * row.spg +
+              COEFF_BPG[kb] * row.bpg;
+
+            for (let position = 0; position < 5; position += 1) {
+              if (!(row.posMask & (1 << position))) continue;
+              const action = position * 4 + row.sig;
+              const denseIndex = row.nameId * actionCount + action;
+              if (
+                value > denseValues[denseIndex] + EPSILON ||
+                (Math.abs(value - denseValues[denseIndex]) <= EPSILON &&
+                  (denseRows[denseIndex] < 0 ||
+                    rowIndex < denseRows[denseIndex]))
+              ) {
+                denseValues[denseIndex] = value;
+                denseRows[denseIndex] = rowIndex;
+              }
+            }
+          }
+
+          const topByAction = Array.from({ length: actionCount }, () => []);
+          const union = new Set();
+          for (let action = 0; action < actionCount; action += 1) {
+            const ranked = [];
+            for (let nameId = 0; nameId < this.nameCount; nameId += 1) {
+              const value = denseValues[nameId * actionCount + action];
+              if (Number.isFinite(value)) ranked.push(nameId);
+            }
+            ranked.sort((left, right) => {
+              const difference =
+                denseValues[right * actionCount + action] -
+                denseValues[left * actionCount + action];
+              return Math.abs(difference) > EPSILON
+                ? difference
+                : this.names[left].localeCompare(this.names[right]);
+            });
+            topByAction[action] = ranked.slice(0, 5);
+            for (const nameId of topByAction[action]) {
+              union.add(nameId);
+              this.relevantNames.add(nameId);
+            }
+          }
+
+          const localNames = [...union].sort((left, right) => left - right);
+          const globalToLocal = new Int16Array(this.nameCount);
+          globalToLocal.fill(-1);
+          const values = new Float64Array(localNames.length * actionCount);
+          values.fill(Number.NEGATIVE_INFINITY);
+          const rowIndices = new Int32Array(localNames.length * actionCount);
+          rowIndices.fill(-1);
+
+          localNames.forEach((nameId, localIndex) => {
+            globalToLocal[nameId] = localIndex;
+            for (let action = 0; action < actionCount; action += 1) {
+              const sourceIndex = nameId * actionCount + action;
+              const targetIndex = localIndex * actionCount + action;
+              values[targetIndex] = denseValues[sourceIndex];
+              rowIndices[targetIndex] = denseRows[sourceIndex];
+            }
+          });
+
+          this.scenarios.push({
+            ks,
+            kb,
+            cs: COEFF_SPG[ks],
+            cb: COEFF_BPG[kb],
+            localNames,
+            globalToLocal,
+            values,
+            rowIndices,
+            topByAction,
+          });
+        }
+      }
+    }
+
+    clearCache() {
+      this.cache.clear();
+    }
+
+    cacheKey(fixedRows, openMask, spgCount, bpgCount) {
+      const excluded = [];
+      for (const row of fixedRows) {
+        if (this.relevantNames.has(row.nameId)) excluded.push(row.nameId);
+      }
+      excluded.sort((left, right) => left - right);
+      return `${openMask}|${spgCount}|${bpgCount}|${excluded.join(".")}`;
+    }
+
+    candidateLocals(scenario, excluded, openMask, remaining) {
+      const candidates = new Set();
+      for (let position = 0; position < 5; position += 1) {
+        if (!(openMask & (1 << position))) continue;
+        for (let sig = 0; sig < 4; sig += 1) {
+          const action = position * 4 + sig;
+          let kept = 0;
+          for (const nameId of scenario.topByAction[action]) {
+            if (excluded.has(nameId)) continue;
+            const local = scenario.globalToLocal[nameId];
+            if (local >= 0) candidates.add(local);
+            kept += 1;
+            if (kept >= remaining) break;
+          }
+        }
+      }
+      return [...candidates];
+    }
+
+    solveScenario(scenario, fixedRows, openMask, spgCount, bpgCount, withPath) {
+      const remaining = popcount(openMask);
+      const neededSpg = scenario.ks - spgCount;
+      const neededBpg = scenario.kb - bpgCount;
+      if (
+        neededSpg < 0 ||
+        neededBpg < 0 ||
+        neededSpg > remaining ||
+        neededBpg > remaining
+      ) {
+        return { value: Number.NEGATIVE_INFINITY, picks: [] };
+      }
+
+      if (remaining === 0) {
+        return neededSpg === 0 && neededBpg === 0
+          ? { value: 0, picks: [] }
+          : { value: Number.NEGATIVE_INFINITY, picks: [] };
+      }
+
+      const excluded = new Set(fixedRows.map((row) => row.nameId));
+      const candidateLocals = this.candidateLocals(
+        scenario,
+        excluded,
+        openMask,
+        remaining,
+      );
+      const stateCount = 32 * 6 * 6;
+      const stateIndex = (mask, steals, blocks) =>
+        (mask * 6 + steals) * 6 + blocks;
+      let values = new Float64Array(stateCount);
+      values.fill(Number.NEGATIVE_INFINITY);
+      values[stateIndex(0, 0, 0)] = 0;
+      let paths = withPath ? new Array(stateCount).fill(null) : null;
+
+      for (const local of candidateLocals) {
+        const nextValues = values.slice();
+        const nextPaths = withPath ? paths.slice() : null;
+
+        for (let index = 0; index < stateCount; index += 1) {
+          const currentValue = values[index];
+          if (!Number.isFinite(currentValue)) continue;
+          const blocks = index % 6;
+          const withoutBlocks = (index - blocks) / 6;
+          const steals = withoutBlocks % 6;
+          const usedMask = (withoutBlocks - steals) / 6;
+
+          for (let position = 0; position < 5; position += 1) {
+            const bit = 1 << position;
+            if (!(openMask & bit) || usedMask & bit) continue;
+            for (let sig = 0; sig < 4; sig += 1) {
+              const action = position * 4 + sig;
+              const actionValue = scenario.values[local * 20 + action];
+              if (!Number.isFinite(actionValue)) continue;
+              const nextSteals = steals + (sig & 1 ? 1 : 0);
+              const nextBlocks = blocks + (sig & 2 ? 1 : 0);
+              if (nextSteals > neededSpg || nextBlocks > neededBpg) continue;
+              const nextIndex = stateIndex(
+                usedMask | bit,
+                nextSteals,
+                nextBlocks,
+              );
+              const proposed = currentValue + actionValue;
+              if (proposed > nextValues[nextIndex] + EPSILON) {
+                nextValues[nextIndex] = proposed;
+                if (withPath) {
+                  const rowIndex = scenario.rowIndices[local * 20 + action];
+                  nextPaths[nextIndex] = {
+                    previous: paths[index],
+                    rowIndex,
+                    position,
+                  };
+                }
+              }
+            }
+          }
+        }
+
+        values = nextValues;
+        if (withPath) paths = nextPaths;
+      }
+
+      const terminalIndex = stateIndex(openMask, neededSpg, neededBpg);
+      const terminalValue = values[terminalIndex];
+      if (!withPath || !Number.isFinite(terminalValue)) {
+        return { value: terminalValue, picks: [] };
+      }
+
+      const picks = [];
+      for (let path = paths[terminalIndex]; path; path = path.previous) {
+        if (path.rowIndex >= 0) {
+          picks.push({
+            row: this.rows[path.rowIndex],
+            position: POSITIONS[path.position],
+          });
+        }
+      }
+      picks.reverse();
+      return { value: terminalValue, picks };
+    }
+
+    completionVector(fixedRows, openMask, spgCount, bpgCount) {
+      const key = this.cacheKey(fixedRows, openMask, spgCount, bpgCount);
+      const cached = this.cache.get(key);
+      if (cached) return cached;
+
+      const vector = new Float64Array(this.scenarios.length);
+      vector.fill(Number.NEGATIVE_INFINITY);
+      this.scenarios.forEach((scenario, index) => {
+        vector[index] = this.solveScenario(
+          scenario,
+          fixedRows,
+          openMask,
+          spgCount,
+          bpgCount,
+          false,
+        ).value;
+      });
+
+      if (this.cache.size > 1600) this.cache.clear();
+      this.cache.set(key, vector);
+      return vector;
+    }
+
+    ceilingForMask(fixedRows, occupiedMask, withLineup = false) {
+      const openMask = FULL_POSITION_MASK & ~occupiedMask;
+      if (fixedRows.length + popcount(openMask) !== 5) {
+        return null;
+      }
+      const uniqueNames = new Set(fixedRows.map((row) => row.player));
+      if (uniqueNames.size !== fixedRows.length) return null;
+
+      let fixedPpg = 0;
+      let fixedRpg = 0;
+      let fixedApg = 0;
+      let fixedSpg = 0;
+      let fixedBpg = 0;
+      let spgCount = 0;
+      let bpgCount = 0;
+      for (const row of fixedRows) {
+        fixedPpg += row.ppg;
+        fixedRpg += row.rpg;
+        fixedApg += row.apg;
+        fixedSpg += row.spg;
+        fixedBpg += row.bpg;
+        if (row.spg > 0) spgCount += 1;
+        if (row.bpg > 0) bpgCount += 1;
+      }
+
+      const offensiveBase =
+        COEFF_PPG * fixedPpg + COEFF_RPG * fixedRpg + COEFF_APG * fixedApg;
+      const vector = this.completionVector(
+        fixedRows,
+        openMask,
+        spgCount,
+        bpgCount,
+      );
+      let bestRaw = Number.NEGATIVE_INFINITY;
+      let bestScenarioIndex = -1;
+      for (let index = 0; index < this.scenarios.length; index += 1) {
+        const future = vector[index];
+        if (!Number.isFinite(future)) continue;
+        const scenario = this.scenarios[index];
+        const raw =
+          offensiveBase +
+          scenario.cs * fixedSpg +
+          scenario.cb * fixedBpg +
+          future;
+        if (raw > bestRaw + EPSILON) {
+          bestRaw = raw;
+          bestScenarioIndex = index;
+        }
+      }
+
+      if (!Number.isFinite(bestRaw)) return null;
+      const score = roundOne(bestRaw);
+      const wins = projectedWins(score);
+      const result = {
+        raw: bestRaw,
+        score,
+        wins,
+        losses: 82 - wins,
+        possible82: wins === 82,
+        openMask,
+        occupiedMask,
+        future: [],
+      };
+
+      if (withLineup && bestScenarioIndex >= 0) {
+        const scenario = this.scenarios[bestScenarioIndex];
+        result.future = this.solveScenario(
+          scenario,
+          fixedRows,
+          openMask,
+          spgCount,
+          bpgCount,
+          true,
+        ).picks;
+      }
+      return result;
+    }
+
+    relaxedCeiling(fixedRows, withAssignment = false) {
+      const masks = new Map();
+      const sorted = [...fixedRows].sort(
+        (left, right) => popcount(left.posMask) - popcount(right.posMask),
+      );
+
+      const visit = (index, mask, assignment) => {
+        if (index === sorted.length) {
+          if (!masks.has(mask)) masks.set(mask, [...assignment]);
+          return;
+        }
+        const row = sorted[index];
+        for (let position = 0; position < 5; position += 1) {
+          const bit = 1 << position;
+          if (!(row.posMask & bit) || mask & bit) continue;
+          assignment.push({ row, position: POSITIONS[position] });
+          visit(index + 1, mask | bit, assignment);
+          assignment.pop();
+        }
+      };
+      visit(0, 0, []);
+
+      let best = null;
+      for (const [mask, assignment] of masks) {
+        const result = this.ceilingForMask(fixedRows, mask, withAssignment);
+        if (!result) continue;
+        if (!best || result.raw > best.raw + EPSILON) {
+          best = { ...result, assignment };
+        }
+      }
+      return best;
+    }
+  }
+
+  function rosterStateKey(slots) {
+    return slots
+      .map((row) =>
+        row ? row.key || row.id || `${row.player}:${row.nameId}` : "-",
+      )
+      .join("\u001f");
+  }
+
+  function reachableRosterStates(entries) {
+    const initial = Array(5).fill(null);
+    for (const entry of entries || []) {
+      const index = POSITION_INDEX[entry.position];
+      if (index === undefined || initial[index]) return [];
+      initial[index] = entry.row;
+    }
+
+    const queue = [{ slots: initial, moves: [] }];
+    const seen = new Set([rosterStateKey(initial)]);
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const state = queue[cursor];
+      for (let from = 0; from < 5; from += 1) {
+        const moving = state.slots[from];
+        if (!moving) continue;
+        for (let to = 0; to < 5; to += 1) {
+          if (from === to || !(moving.posMask & (1 << to))) continue;
+          const displaced = state.slots[to];
+          if (displaced && !(displaced.posMask & (1 << from))) continue;
+          const slots = [...state.slots];
+          slots[to] = moving;
+          slots[from] = displaced || null;
+          const key = rosterStateKey(slots);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          queue.push({
+            slots,
+            moves: [
+              ...state.moves,
+              {
+                player: moving.player,
+                from: POSITIONS[from],
+                to: POSITIONS[to],
+                swapPlayer: displaced?.player || null,
+              },
+            ],
+          });
+        }
+      }
+    }
+    return queue;
+  }
+
+  function shortestPlacementPlan(
+    states,
+    row,
+    desiredMask = null,
+    desiredPosition = null,
+  ) {
+    let best = null;
+    for (const state of states || []) {
+      let mask = 0;
+      for (let index = 0; index < 5; index += 1) {
+        if (state.slots[index]) mask |= 1 << index;
+      }
+      for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+        const bit = 1 << positionIndex;
+        if (state.slots[positionIndex] || !(row.posMask & bit)) continue;
+        if (desiredPosition && POSITIONS[positionIndex] !== desiredPosition)
+          continue;
+        const postMask = mask | bit;
+        if (desiredMask !== null && postMask !== desiredMask) continue;
+        const plan = {
+          position: POSITIONS[positionIndex],
+          postMask,
+          moves: state.moves,
+          slots: state.slots,
+        };
+        if (
+          !best ||
+          plan.moves.length < best.moves.length ||
+          (plan.moves.length === best.moves.length &&
+            POSITION_INDEX[plan.position] < POSITION_INDEX[best.position])
+        ) {
+          best = plan;
+        }
+      }
+    }
+    return best;
+  }
+
+  class MulberryRng {
+    constructor(seed) {
+      this.state = Number(seed) >>> 0;
+    }
+
+    next() {
+      let value = (this.state = (this.state + 0x6d2b79f5) >>> 0);
+      value = Math.imul(value ^ (value >>> 15), 1 | value);
+      value ^= value + Math.imul(value ^ (value >>> 7), 61 | value);
+      return ((value ^ (value >>> 14)) >>> 0) / 0x100000000;
+    }
+
+    clone() {
+      const copy = new MulberryRng(0);
+      copy.state = this.state;
+      return copy;
+    }
+  }
+
+  function buildStudioDrawIndex(players) {
+    const byId = new Map();
+    const squadByKey = new Map();
+    const idByKey = new Map();
+    for (const source of Array.isArray(players) ? players : []) {
+      const name = source?.name || source?.player;
+      const positions = Array.isArray(source?.positions)
+        ? [...source.positions]
+        : [];
+      if (!source?.id || !source.team || !ERAS.has(source.era) || !name)
+        continue;
+      const player = {
+        id: String(source.id),
+        team: String(source.team),
+        era: String(source.era),
+        name: String(name),
+        positions,
+        posMask: positionMask(positions),
+      };
+      byId.set(player.id, player);
+      idByKey.set(`${player.name}|${player.team}|${player.era}`, player.id);
+      const key = `${player.team}|${player.era}`;
+      if (!squadByKey.has(key)) squadByKey.set(key, []);
+      squadByKey.get(key).push(player);
+    }
+    return {
+      byId,
+      squadByKey,
+      idByKey,
+      sortedKeys: [...squadByKey.keys()].sort(),
+    };
+  }
+
+  function criticalStudioPlayerIds(index) {
+    const critical = new Set();
+    for (const squad of index.squadByKey.values()) {
+      for (let openMask = 1; openMask <= FULL_POSITION_MASK; openMask += 1) {
+        const legal = squad.filter((player) => player.posMask & openMask);
+        if (legal.length > 4) continue;
+        for (const player of legal) critical.add(player.id);
+      }
+    }
+    return critical;
+  }
+
+  class StudioShadowSession {
+    constructor(payload, players) {
+      this.sessionId = payload.session_id;
+      this.seed = Number(payload.seed) >>> 0;
+      this.slots = payload.slots.map((slot) => ({
+        id: String(slot.id),
+        positions: [...slot.positions],
+      }));
+      this.respinBudget = { ...payload.respin_budget };
+      this.index = buildStudioDrawIndex(players);
+      this.rng = new MulberryRng(this.seed);
+      this.openSlots = [...this.slots];
+      this.placed = new Set();
+      this.respins = [];
+      this.step = 0;
+      this.current = null;
+      this.drawnStep = -1;
+    }
+
+    clone() {
+      const copy = Object.create(StudioShadowSession.prototype);
+      copy.sessionId = this.sessionId;
+      copy.seed = this.seed;
+      copy.slots = this.slots;
+      copy.respinBudget = this.respinBudget;
+      copy.index = this.index;
+      copy.rng = this.rng.clone();
+      copy.openSlots = [...this.openSlots];
+      copy.placed = new Set(this.placed);
+      copy.respins = [...this.respins];
+      copy.step = this.step;
+      copy.current = this.current;
+      copy.drawnStep = this.drawnStep;
+      return copy;
+    }
+
+    isPlayerLegalForSlot(player, slot) {
+      return slot.positions.some((position) =>
+        player.positions.includes(position),
+      );
+    }
+
+    drawSpin(options = {}) {
+      let keys = this.index.sortedKeys;
+      if (
+        options.lockedTeam ||
+        options.lockedEra ||
+        options.excludedTeam ||
+        options.excludedEra ||
+        options.excludeKey
+      ) {
+        keys = keys.filter((key) => {
+          const [team, era] = key.split("|");
+          return (
+            (!options.lockedTeam || team === options.lockedTeam) &&
+            (!options.lockedEra || era === options.lockedEra) &&
+            (!options.excludedTeam || team !== options.excludedTeam) &&
+            (!options.excludedEra || era !== options.excludedEra) &&
+            (!options.excludeKey || key !== options.excludeKey)
+          );
+        });
+      }
+      const shuffled = [...keys];
+      for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(this.rng.next() * (index + 1));
+        [shuffled[index], shuffled[swapIndex]] = [
+          shuffled[swapIndex],
+          shuffled[index],
+        ];
+      }
+      for (const key of shuffled) {
+        const squad = this.index.squadByKey.get(key) || [];
+        const legal = squad.some(
+          (player) =>
+            !this.placed.has(player.id) &&
+            this.openSlots.some((slot) =>
+              this.isPlayerLegalForSlot(player, slot),
+            ),
+        );
+        if (!legal) continue;
+        const [team, era] = key.split("|");
+        return { team, era, squad };
+      }
+      return null;
+    }
+
+    nextSpin() {
+      if (this.drawnStep === this.step && this.current) return this.current;
+      const draw = this.drawSpin();
+      if (!draw) return null;
+      this.drawnStep = this.step;
+      this.current = draw;
+      return draw;
+    }
+
+    remainingRespins(scope) {
+      return (
+        finiteNumber(this.respinBudget[scope]) -
+        this.respins.filter((respin) => respin.scope === scope).length
+      );
+    }
+
+    respin(scope) {
+      if (!this.current || this.remainingRespins(scope) <= 0) return null;
+      const options =
+        scope === "team"
+          ? { lockedEra: this.current.era, excludedTeam: this.current.team }
+          : { lockedTeam: this.current.team, excludedEra: this.current.era };
+      this.respins.push({ scope, at_slot: this.step });
+      const draw = this.drawSpin(options);
+      if (!draw) return null;
+      this.current = draw;
+      return draw;
+    }
+
+    resolvePlayerId(row) {
+      return (
+        this.index.idByKey.get(`${row.player}|${row.team}|${row.era}`) || null
+      );
+    }
+
+    recordPick(requestedSlotId, playerId) {
+      const player = this.index.byId.get(playerId);
+      if (!player || this.placed.has(playerId) || !this.openSlots.length)
+        return false;
+      const compatible = (slot) => this.isPlayerLegalForSlot(player, slot);
+      const slot =
+        this.openSlots.find(
+          (candidate) =>
+            candidate.id === requestedSlotId && compatible(candidate),
+        ) ||
+        this.openSlots.find(compatible) ||
+        this.openSlots[0];
+      this.placed.add(playerId);
+      this.openSlots = this.openSlots.filter(
+        (candidate) => candidate.id !== slot.id,
+      );
+      this.step += 1;
+      this.current = null;
+      return true;
+    }
+  }
+
+  const Core = {
+    POSITIONS,
+    TARGET_SCORE,
+    normalizeDataset,
+    calculateTeamResult,
+    projectedWins,
+    rawTeamScore,
+    roundOne,
+    positionMask,
+    reachableRosterStates,
+    shortestPlacementPlan,
+    MulberryRng,
+    buildStudioDrawIndex,
+    criticalStudioPlayerIds,
+    StudioShadowSession,
+    ExactCeilingOptimizer,
+  };
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = Core;
+  }
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  if (!/(^|\.)82-0\.com$/i.test(location.hostname)) return;
+
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = (...args) => {
+    const request = nativeFetch(...args);
+    request
+      .then((response) => {
+        if (
+          !response.ok ||
+          !response.url.includes("/game-session/api/v1/session/start")
+        )
+          return;
+        response
+          .clone()
+          .json()
+          .then((payload) => captureStudioSession(payload))
+          .catch(() => {});
+      })
+      .catch(() => {});
+    return request;
+  };
+
+  const runtime = {
+    dataReady: false,
+    loadError: null,
+    rows: [],
+    names: [],
+    nameToId: new Map(),
+    namesSet: new Set(),
+    byCell: new Map(),
+    byKey: new Map(),
+    rowsByName: new Map(),
+    teams: new Set(),
+    optimizer: null,
+    tracked: new Map(),
+    lastOffers: new Map(),
+    recentOffers: new Map(),
+    selectedRow: null,
+    pendingPick: null,
+    lastCell: null,
+    lastAdvice: null,
+    lastAdviceSignature: "",
+    lastAnalysisKey: "",
+    lastAnalysis: null,
+    analysisInProgressKey: "",
+    persistedPicks: new Map(),
+    pickOrder: 0,
+    emptyTraySince: 0,
+    sessionPayload: null,
+    shadowSession: null,
+    shadowReady: false,
+    shadowSynced: false,
+    shadowError: null,
+    shadowPendingCell: null,
+    shadowPendingFrom: null,
+    criticalStudioIds: new Set(),
+    safetyOverride: null,
+    scanTimer: 0,
+    scanSerial: 0,
+    resultMismatchCandidate: null,
+    modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
+    mode: safeSessionGet(MODE_KEY) || "classic",
+  };
+
+  function safeSessionGet(key) {
+    try {
+      return sessionStorage.getItem(key);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function safeSessionSet(key, value) {
+    try {
+      sessionStorage.setItem(key, value);
+    } catch (_) {}
+  }
+
+  function safeSessionRemove(key) {
+    try {
+      sessionStorage.removeItem(key);
+    } catch (_) {}
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function readUiState() {
+    try {
+      return {
+        collapsed: false,
+        details: false,
+        hidden: false,
+        ...JSON.parse(localStorage.getItem(UI_KEY) || "{}"),
+      };
+    } catch (_) {
+      return { collapsed: false, details: false, hidden: false };
+    }
+  }
+
+  function writeUiState(next) {
+    try {
+      localStorage.setItem(UI_KEY, JSON.stringify(next));
+    } catch (_) {}
+  }
+
+  function directText(element) {
+    return [...element.childNodes]
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isVisible(element) {
+    if (!element || !element.isConnected) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      rect.width > 0 &&
+      rect.height > 0 &&
+      element.getClientRects().length > 0
+    );
+  }
+
+  function installSiteStyles() {
+    if (document.getElementById(SITE_STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = SITE_STYLE_ID;
+    style.textContent = `
+      [data-82coach-card] {
+        position: relative !important;
+        outline: 3px solid var(--82coach-color) !important;
+        outline-offset: -2px !important;
+        box-shadow: 0 0 0 2px rgba(2,6,23,.8), 0 0 18px color-mix(in srgb, var(--82coach-color) 55%, transparent) !important;
+      }
+      [data-82coach-card]::after {
+        content: attr(data-82coach-label);
+        position: absolute;
+        top: 5px;
+        right: 7px;
+        z-index: 5;
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: var(--82coach-color);
+        color: #081018;
+        font: 800 10px/1.35 system-ui, sans-serif;
+        letter-spacing: .03em;
+        pointer-events: none;
+      }
+      [data-82coach-card^="fallback"] { outline-style: dashed !important; }
+      [data-82coach-locked="true"] {
+        pointer-events: none !important;
+        opacity: .42 !important;
+        filter: grayscale(.55) saturate(.5) !important;
+      }
+      [data-82coach-position="true"] {
+        outline: 3px solid ${COLORS.position} !important;
+        outline-offset: 3px !important;
+        box-shadow: 0 0 18px rgba(56,189,248,.72) !important;
+      }
+      [data-82coach-retry="team"] {
+        outline: 3px solid ${COLORS.team} !important;
+        outline-offset: 2px !important;
+        box-shadow: 0 0 18px rgba(245,158,11,.75) !important;
+        animation: __82coachPulse 1.1s ease-in-out infinite alternate;
+      }
+      [data-82coach-retry="era"] {
+        outline: 3px solid ${COLORS.era} !important;
+        outline-offset: 2px !important;
+        box-shadow: 0 0 18px rgba(168,85,247,.75) !important;
+        animation: __82coachPulse 1.1s ease-in-out infinite alternate;
+      }
+      @keyframes __82coachPulse { from { filter:brightness(1); } to { filter:brightness(1.32); } }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function getPanel() {
+    let host = document.getElementById(PANEL_ID);
+    if (host) return host;
+    host = document.createElement("div");
+    host.id = PANEL_ID;
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        :host { all:initial; position:fixed; right:10px; bottom:12px; z-index:2147483646; color-scheme:dark; }
+        * { box-sizing: border-box; }
+        button { font: inherit; }
+        #card { width:min(292px,calc(100vw - 20px)); color:#e5edf6; background:rgba(5,12,23,.965); border:1px solid #26364c; border-radius:14px; box-shadow:0 14px 38px rgba(0,0,0,.55); font:12px/1.35 system-ui,-apple-system,sans-serif; overflow:hidden; backdrop-filter:blur(12px); }
+        #card.hidden { width:auto; border-radius:999px; }
+        header { height:34px; padding:0 8px 0 11px; display:flex; align-items:center; gap:7px; border-bottom:1px solid #1b293b; user-select:none; }
+        #card.hidden header { border:0; padding:0 6px 0 10px; }
+        .logo { font-size:14px; }
+        .title { font-size:10px; font-weight:900; letter-spacing:.08em; text-transform:uppercase; color:#9fb0c4; flex:1; white-space:nowrap; }
+        .mode { color:#64748b; font-size:9px; font-weight:800; }
+        .icon { border:0; background:transparent; color:#7f93aa; width:23px; height:23px; border-radius:7px; cursor:pointer; padding:0; }
+        .icon:hover { color:#fff; background:#1d2a3c; }
+        main { padding:10px; }
+        #card.collapsed main { display:none; }
+        .status { display:flex; align-items:center; gap:7px; margin-bottom:7px; color:#aab8c8; font-size:10px; }
+        .dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:var(--status,#38bdf8); box-shadow:0 0 9px var(--status,#38bdf8); }
+        .action { --action:#38bdf8; border:1px solid color-mix(in srgb,var(--action) 55%,#172337); background:color-mix(in srgb,var(--action) 10%,#07101e); border-radius:10px; padding:9px 10px; }
+        .eyebrow { color:var(--action); font-size:9px; font-weight:900; letter-spacing:.11em; text-transform:uppercase; }
+        .primary { margin-top:2px; display:flex; align-items:baseline; gap:6px; min-width:0; }
+        .name { font-size:16px; line-height:1.12; font-weight:900; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .arrow { color:#73869c; font-weight:700; }
+        .position { color:#7dd3fc; font-size:15px; font-weight:900; }
+        .sub { color:#9eafc2; font-size:10px; margin-top:4px; }
+        .metrics { display:grid; grid-template-columns:1fr auto; gap:3px 8px; margin-top:8px; padding-top:7px; border-top:1px solid #1a2a3d; color:#7f93aa; font-size:10px; }
+        .metrics strong { color:#d9e5f2; text-align:right; }
+        #card:not(.details-open) .metrics,
+        #card:not(.details-open) .fallback { display:none; }
+        .details-toggle { width:100%; margin-top:7px; border:0; background:transparent; color:#6f8298; font-size:10px; padding:3px; cursor:pointer; }
+        .details-toggle:hover { color:#c9d7e6; }
+        .details { margin-top:8px; padding-top:8px; border-top:1px solid #182538; color:#8ea0b4; font-size:10px; }
+        .row { display:flex; justify-content:space-between; gap:8px; padding:3px 0; }
+        .row strong { color:#d3deea; text-align:right; }
+        .route { margin-top:7px; padding-top:7px; border-top:1px solid #182538; }
+        .route-title { margin-bottom:3px; color:#d3deea; font-weight:800; }
+        .route-step { display:grid; grid-template-columns:20px 1fr; gap:5px; padding:2px 0; }
+        .route-step span { color:#64748b; font-weight:800; }
+        .route-step strong { min-width:0; color:#b8c6d6; font-weight:600; overflow-wrap:anywhere; }
+        .fallback { margin-top:7px; padding:6px 7px; border-radius:7px; background:#0c1726; color:#9aacbf; }
+        .fallback strong { color:#e7eef7; }
+        .filter-hint { margin-top:7px; padding:6px 7px; border-radius:7px; background:#17233a; color:#bfdbfe; }
+        .safety { display:flex; gap:7px; align-items:center; margin-top:8px; padding:7px; background:#351b09; border:1px solid #7c3d0a; border-radius:8px; color:#fdba74; }
+        .unlock { margin-left:auto; border:1px solid #a85a15; background:#542807; color:#fed7aa; border-radius:6px; padding:3px 6px; cursor:pointer; white-space:nowrap; }
+        .legend { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; color:#60748c; font-size:9px; }
+        .swatch::before { content:''; display:inline-block; width:6px; height:6px; border-radius:2px; margin-right:3px; background:var(--c); }
+        .loading { padding:5px 2px; color:#93a4b8; }
+        .error { color:#fca5a5; }
+        @media (max-width:767px) {
+          #card { width:min(238px,calc(100vw - 16px)); }
+          :host { right:8px; bottom:calc(88px + env(safe-area-inset-bottom)); }
+          header { height:30px; }
+          main { padding:6px; }
+          .status { margin-bottom:3px; font-size:9px; line-height:1.15; }
+          .action { padding:5px 7px; }
+          .primary { margin-top:0; }
+          .name { font-size:14px; }
+          .position { font-size:13px; }
+          #card:not(.details-open) .sub { display:none; }
+          .safety { margin-top:4px; padding:3px 5px; font-size:9px; }
+          .safety-copy { display:none; }
+          .unlock { padding:2px 4px; }
+          .details-toggle { margin-top:2px; padding:1px; }
+        }
+        @media (prefers-reduced-motion:reduce) { * { animation:none !important; transition:none !important; } }
+      </style>
+      <div id="card"><header><span class="logo">🏀</span><span class="title">82-0 Coach</span><span class="mode"></span><button class="icon" id="collapse" title="Collapse">—</button><button class="icon" id="hide" title="Hide (Alt+A restores)">×</button></header><main id="content" role="status" aria-live="polite" aria-atomic="true"></main></div>
+    `;
+    document.body.appendChild(host);
+
+    const state = readUiState();
+    const card = shadow.getElementById("card");
+    card.classList.toggle("collapsed", state.collapsed);
+    card.classList.toggle("hidden", state.hidden);
+    card.classList.toggle("details-open", state.details);
+    shadow.getElementById("collapse").textContent = state.collapsed ? "+" : "—";
+    shadow.getElementById("collapse").onclick = () => {
+      const current = readUiState();
+      current.collapsed = !current.collapsed;
+      current.hidden = false;
+      writeUiState(current);
+      card.classList.toggle("collapsed", current.collapsed);
+      card.classList.remove("hidden");
+      shadow.getElementById("collapse").textContent = current.collapsed
+        ? "+"
+        : "—";
+    };
+    shadow.getElementById("hide").onclick = () => {
+      const current = readUiState();
+      current.hidden = !current.hidden;
+      current.collapsed = current.hidden ? true : current.collapsed;
+      writeUiState(current);
+      card.classList.toggle("hidden", current.hidden);
+      card.classList.toggle("collapsed", current.collapsed);
+      shadow.getElementById("collapse").textContent = current.collapsed
+        ? "+"
+        : "—";
+    };
+    return host;
+  }
+
+  function modeLabel() {
+    if (runtime.mode === "hoopiq") return "HOOP IQ";
+    if (runtime.mode === "1v1") return "1V1";
+    return "CLASSIC";
+  }
+
+  function setMode(mode) {
+    if (!["classic", "hoopiq", "1v1"].includes(mode)) return;
+    runtime.mode = mode;
+    safeSessionSet(MODE_KEY, mode);
+  }
+
+  function loadPersistedPicks() {
+    runtime.persistedPicks.clear();
+    runtime.pickOrder = 0;
+    try {
+      const payload = JSON.parse(safeSessionGet(PICKS_KEY) || "null");
+      if (
+        payload?.version !== 1 ||
+        !Array.isArray(payload.picks) ||
+        Date.now() - finiteNumber(payload.timestamp) > PICKS_MAX_AGE
+      ) {
+        safeSessionRemove(PICKS_KEY);
+        return;
+      }
+      for (const saved of payload.picks) {
+        const row = runtime.byKey.get(saved?.key);
+        if (!row || POSITION_INDEX[saved.position] === undefined) continue;
+        const tracked = {
+          row,
+          position: saved.position,
+          originalPosition:
+            POSITION_INDEX[saved.originalPosition] === undefined
+              ? saved.position
+              : saved.originalPosition,
+          order: Math.max(1, Math.trunc(finiteNumber(saved.order))),
+        };
+        runtime.persistedPicks.set(row.player, tracked);
+        runtime.pickOrder = Math.max(runtime.pickOrder, tracked.order);
+      }
+    } catch (_) {
+      safeSessionRemove(PICKS_KEY);
+    }
+  }
+
+  function persistTrackedPicks() {
+    const picks = [...runtime.tracked.values()]
+      .filter(
+        (tracked) =>
+          tracked?.row && POSITION_INDEX[tracked.position] !== undefined,
+      )
+      .sort(
+        (left, right) => finiteNumber(left.order) - finiteNumber(right.order),
+      )
+      .map((tracked) => ({
+        key: tracked.row.key,
+        position: tracked.position,
+        originalPosition: tracked.originalPosition,
+        order: tracked.order,
+      }));
+    if (!picks.length) {
+      safeSessionRemove(PICKS_KEY);
+      runtime.persistedPicks.clear();
+      runtime.pickOrder = 0;
+      return;
+    }
+    safeSessionSet(
+      PICKS_KEY,
+      JSON.stringify({
+        version: 1,
+        timestamp: Date.now(),
+        mode: runtime.mode,
+        picks,
+      }),
+    );
+    runtime.persistedPicks = new Map(
+      [...runtime.tracked.entries()].map(([name, tracked]) => [
+        name,
+        { ...tracked },
+      ]),
+    );
+  }
+
+  async function captureStudioSession(payload) {
+    if (
+      !payload?.session_id ||
+      !Number.isFinite(Number(payload.seed)) ||
+      !payload.dataset_url ||
+      !Array.isArray(payload.slots) ||
+      payload.slots.length !== 5 ||
+      !payload.slots.every(
+        (slot) =>
+          POSITION_INDEX[slot?.id] !== undefined &&
+          Array.isArray(slot.positions) &&
+          slot.positions.every(
+            (position) => POSITION_INDEX[position] !== undefined,
+          ),
+      )
+    )
+      return;
+
+    const capturedSessionId = String(payload.session_id);
+    if (runtime.sessionPayload?.session_id !== capturedSessionId) {
+      resetRuntime(runtime.mode);
+    }
+    // Deliberately omit payload.user and any authentication-adjacent response data.
+    runtime.sessionPayload = {
+      session_id: capturedSessionId,
+      seed: Number(payload.seed) >>> 0,
+      dataset_version: String(payload.dataset_version || ""),
+      dataset_url: String(payload.dataset_url),
+      slots: payload.slots.map((slot) => ({
+        id: String(slot.id),
+        positions: [...(slot.positions || [])],
+      })),
+      respin_budget: { ...payload.respin_budget },
+    };
+    runtime.shadowReady = false;
+    runtime.shadowSynced = false;
+    runtime.shadowError = null;
+    runtime.shadowPendingCell = null;
+    runtime.shadowPendingFrom = null;
+
+    try {
+      const response = await nativeFetch(runtime.sessionPayload.dataset_url);
+      if (!response.ok)
+        throw new Error(`session dataset returned ${response.status}`);
+      const dataset = await response.json();
+      if (runtime.sessionPayload?.session_id !== capturedSessionId) return;
+      const index = buildStudioDrawIndex(dataset?.players);
+      if (
+        !Array.isArray(dataset?.players) ||
+        index.byId.size < 10_000 ||
+        index.sortedKeys.length < 150 ||
+        (runtime.sessionPayload.dataset_version &&
+          String(dataset.version) !== runtime.sessionPayload.dataset_version)
+      ) {
+        throw new Error("session dataset failed completeness checks");
+      }
+      runtime.shadowSession = new StudioShadowSession(
+        runtime.sessionPayload,
+        dataset.players,
+      );
+      runtime.criticalStudioIds = criticalStudioPlayerIds(
+        runtime.shadowSession.index,
+      );
+      runtime.shadowReady = true;
+      runtime.shadowError = null;
+      runtime.lastAnalysisKey = "";
+      runtime.lastAnalysis = null;
+      if (document.body) scheduleScan(0);
+    } catch (error) {
+      if (runtime.sessionPayload?.session_id !== capturedSessionId) return;
+      console.warn(
+        "[82-0 Coach] Exact seeded retry prediction unavailable",
+        error,
+      );
+      runtime.shadowSession = null;
+      runtime.shadowReady = false;
+      runtime.shadowSynced = false;
+      runtime.shadowError = String(error?.message || error);
+    }
+  }
+
+  function sameCell(left, right) {
+    return Boolean(
+      left && right && left.team === right.team && left.era === right.era,
+    );
+  }
+
+  function syncShadowToCell(cell) {
+    const shadow = runtime.shadowSession;
+    if (!runtime.shadowReady || !shadow) return "unavailable";
+
+    if (runtime.shadowPendingCell) {
+      if (sameCell(cell, runtime.shadowPendingCell)) {
+        runtime.shadowPendingCell = null;
+        runtime.shadowPendingFrom = null;
+        runtime.shadowSynced = true;
+        runtime.shadowError = null;
+        return "synced";
+      }
+      if (sameCell(cell, runtime.shadowPendingFrom)) return "waiting";
+      runtime.shadowSynced = false;
+      runtime.shadowError = `predicted ${runtime.shadowPendingCell.team} ${runtime.shadowPendingCell.era}, saw ${cell.team} ${cell.era}`;
+      runtime.shadowPendingCell = null;
+      runtime.shadowPendingFrom = null;
+      return "mismatch";
+    }
+
+    const predicted = shadow.current || shadow.nextSpin();
+    if (sameCell(cell, predicted)) {
+      runtime.shadowSynced = true;
+      runtime.shadowError = null;
+      return "synced";
+    }
+    runtime.shadowSynced = false;
+    runtime.shadowError = predicted
+      ? `predicted ${predicted.team} ${predicted.era}, saw ${cell.team} ${cell.era}`
+      : "seeded draw reached a dead end";
+    return "mismatch";
+  }
+
+  function commitShadowPick(row, requestedPosition) {
+    const shadow = runtime.shadowSession;
+    if (!runtime.shadowReady || !runtime.shadowSynced || !shadow?.current)
+      return;
+    const playerId = shadow.resolvePlayerId(row);
+    if (!playerId) {
+      runtime.shadowSynced = false;
+      runtime.shadowError = `could not resolve ${row.player}`;
+      return;
+    }
+    const from = { team: shadow.current.team, era: shadow.current.era };
+    if (!shadow.recordPick(requestedPosition, playerId)) {
+      runtime.shadowSynced = false;
+      runtime.shadowError = `could not record ${row.player}`;
+      return;
+    }
+    if (shadow.openSlots.length) {
+      const predicted = shadow.nextSpin();
+      runtime.shadowPendingFrom = from;
+      runtime.shadowPendingCell = predicted
+        ? { team: predicted.team, era: predicted.era }
+        : null;
+    }
+  }
+
+  function commitShadowRetry(scope) {
+    const shadow = runtime.shadowSession;
+    if (!runtime.shadowReady || !runtime.shadowSynced || !shadow?.current)
+      return;
+    const from = { team: shadow.current.team, era: shadow.current.era };
+    const predicted = shadow.respin(scope);
+    if (!predicted) {
+      runtime.shadowSynced = false;
+      runtime.shadowError = `${scope} retry prediction reached a dead end`;
+      return;
+    }
+    runtime.shadowPendingFrom = from;
+    runtime.shadowPendingCell = { team: predicted.team, era: predicted.era };
+  }
+
+  function renderPanel(html, signature) {
+    const host = getPanel();
+    const shadow = host.shadowRoot;
+    shadow.querySelector(".mode").textContent = modeLabel();
+    shadow
+      .getElementById("card")
+      .classList.toggle("details-open", readUiState().details);
+    if (runtime.lastAdviceSignature === signature) return;
+    runtime.lastAdviceSignature = signature;
+    shadow.getElementById("content").innerHTML = html;
+
+    const detailsButton = shadow.getElementById("details-toggle");
+    if (detailsButton) {
+      detailsButton.onclick = () => {
+        const state = readUiState();
+        state.details = !state.details;
+        writeUiState(state);
+        runtime.lastAdviceSignature = "";
+        scheduleScan(0);
+      };
+    }
+    const unlock = shadow.getElementById("unlock-picks");
+    if (unlock) {
+      unlock.onclick = () => {
+        if (!runtime.lastAdvice?.cellSignature) return;
+        runtime.safetyOverride = runtime.lastAdvice.cellSignature;
+        runtime.lastAdviceSignature = "";
+        scheduleScan(0);
+      };
+    }
+  }
+
+  function renderLoading(message, error = false) {
+    clearHighlights();
+    renderPanel(
+      `<div class="loading ${error ? "error" : ""}">${escapeHtml(message)}</div>`,
+      `loading:${message}:${error}`,
+    );
+  }
+
+  function lockForAnalysis(cards, retries) {
+    renderLoading("Analyzing this roll…");
+    for (const { element } of cards)
+      element.setAttribute("data-82coach-locked", "true");
+    for (const position of POSITIONS) {
+      for (const target of findPositionTargets(position, {
+        includeTray: true,
+        openOnly: true,
+      })) {
+        target.setAttribute("data-82coach-locked", "true");
+      }
+    }
+    retries.team.element?.setAttribute("data-82coach-locked", "true");
+    retries.era.element?.setAttribute("data-82coach-locked", "true");
+  }
+
+  async function loadRows() {
+    let data = null;
+    try {
+      const cached = JSON.parse(localStorage.getItem(DATA_CACHE_KEY) || "null");
+      if (
+        cached?.version === "v2" &&
+        Array.isArray(cached.data) &&
+        Date.now() - finiteNumber(cached.timestamp) < 7 * 24 * 60 * 60 * 1000
+      ) {
+        data = cached.data;
+      }
+    } catch (_) {
+      data = null;
+    }
+
+    if (!data) {
+      const response = await fetch(DATA_URL, { credentials: "same-origin" });
+      if (!response.ok)
+        throw new Error(`player data returned ${response.status}`);
+      data = await response.json();
+    }
+
+    const normalized = normalizeDataset(data);
+    const coveredPositions = normalized.rows.reduce(
+      (mask, row) => mask | row.posMask,
+      0,
+    );
+    const cellCount = new Set(
+      normalized.rows.map((row) => `${row.team}|${row.era}`),
+    ).size;
+    if (
+      normalized.rows.length < 10_000 ||
+      normalized.names.length < 3_000 ||
+      cellCount < 150 ||
+      coveredPositions !== FULL_POSITION_MASK
+    ) {
+      throw new Error("player dataset failed completeness checks");
+    }
+    runtime.rows = normalized.rows;
+    runtime.names = normalized.names;
+    runtime.nameToId = normalized.nameToId;
+    runtime.namesSet = new Set(normalized.names);
+
+    for (const row of runtime.rows) {
+      runtime.byKey.set(row.key, row);
+      const cell = `${row.team}|${row.era}`;
+      if (!runtime.byCell.has(cell)) runtime.byCell.set(cell, []);
+      runtime.byCell.get(cell).push(row);
+      if (!runtime.rowsByName.has(row.player))
+        runtime.rowsByName.set(row.player, []);
+      runtime.rowsByName.get(row.player).push(row);
+      runtime.teams.add(row.team);
+    }
+
+    loadPersistedPicks();
+
+    runtime.optimizer = new ExactCeilingOptimizer(runtime.rows, runtime.names);
+    runtime.dataReady = true;
+  }
+
+  function getPlayerListRoot() {
+    const inputs = [...document.querySelectorAll("input")];
+    const search = inputs.find((input) =>
+      /search/i.test(input.getAttribute("placeholder") || ""),
+    );
+    if (search) {
+      return (
+        search.closest(".space-y-3") ||
+        search.parentElement?.parentElement?.parentElement ||
+        null
+      );
+    }
+    // Localized copies may not use the English "Search..." placeholder.
+    const fallbackCard = [...document.querySelectorAll("div[draggable]")].find(
+      (element) => Boolean(rowFromCard(element)),
+    );
+    return fallbackCard?.parentElement || null;
+  }
+
+  function rowFromCard(card) {
+    if (!card) return null;
+    const paragraphs = [...card.querySelectorAll("p")];
+    const nameElement = paragraphs.find((paragraph) =>
+      runtime.namesSet.has(paragraph.textContent.trim()),
+    );
+    if (!nameElement) return null;
+    const name = nameElement.textContent.trim();
+    const cellText = paragraphs
+      .map((paragraph) => paragraph.textContent.trim())
+      .find((text) => /\b[A-Z0-9]{2,4}\s*·\s*(?:19|20)\d0s\b/.test(text));
+    if (!cellText) return null;
+    const match = cellText.match(/\b([A-Z0-9]{2,4})\s*·\s*((?:19|20)\d0s)\b/);
+    if (!match) return null;
+    return runtime.byKey.get(`${name}|${match[1]}|${match[2]}`) || null;
+  }
+
+  function findCards() {
+    const root = getPlayerListRoot();
+    if (!root) return [];
+    const cards = [];
+    for (const candidate of root.querySelectorAll("div[draggable]")) {
+      const row = rowFromCard(candidate);
+      if (!row) continue;
+      cards.push({
+        element: candidate,
+        row,
+        enabled: candidate.getAttribute("draggable") === "true",
+      });
+    }
+    return cards;
+  }
+
+  function parseCell(cards) {
+    if (cards.length) return { team: cards[0].row.team, era: cards[0].row.era };
+    return runtime.lastCell;
+  }
+
+  function parseTray() {
+    const tray = document.querySelector("[data-lineup-tray]");
+    if (!tray) return { present: false, slots: new Map() };
+    const slots = new Map();
+    for (const slot of tray.querySelectorAll('[role="button"]')) {
+      const position = [...slot.querySelectorAll("span")]
+        .map((element) => element.textContent.trim())
+        .find((text) => POSITION_INDEX[text] !== undefined);
+      if (!position) continue;
+      let name = [...slot.querySelectorAll("p")]
+        .map((element) => element.textContent.trim())
+        .find((text) => runtime.namesSet.has(text));
+      if (!name) {
+        const label = slot.getAttribute("aria-label") || "";
+        const english = label.match(/^(PG|SG|SF|PF|C)\s*:\s*(.+?)(?:,|$)/);
+        if (english && runtime.namesSet.has(english[2])) name = english[2];
+        if (!name) {
+          name = [...runtime.tracked.keys()].find((candidate) =>
+            label.includes(candidate),
+          );
+        }
+      }
+      if (name) slots.set(position, name);
+    }
+    return { present: true, slots };
+  }
+
+  function commitPendingPickIfNeeded(trayState) {
+    const pending = runtime.pendingPick;
+    if (!pending) return;
+    const found = [...trayState.slots.entries()].find(
+      ([, name]) => name === pending.row.player,
+    );
+    const onResults = findResultButton() !== null;
+    const finalTransition =
+      !trayState.present &&
+      runtime.tracked.size === 4 &&
+      !getPlayerListRoot() &&
+      Date.now() - pending.time > 60;
+    if (found || onResults || finalTransition) {
+      const position = found?.[0] || pending.position;
+      runtime.tracked.set(pending.row.player, {
+        row: pending.row,
+        position,
+        originalPosition: pending.position,
+        order: ++runtime.pickOrder,
+      });
+      commitShadowPick(pending.row, pending.position);
+      runtime.pendingPick = null;
+      runtime.selectedRow = null;
+      persistTrackedPicks();
+    } else if (Date.now() - pending.time > 1600) {
+      runtime.pendingPick = null;
+    }
+  }
+
+  function reconcileRoster() {
+    const trayState = parseTray();
+    commitPendingPickIfNeeded(trayState);
+    if (!trayState.present) return trayState;
+
+    if (trayState.slots.size === 0 && runtime.tracked.size) {
+      if (!runtime.emptyTraySince) {
+        runtime.emptyTraySince = Date.now();
+        scheduleScan(850);
+        return trayState;
+      }
+      if (Date.now() - runtime.emptyTraySince < 750) return trayState;
+      runtime.tracked.clear();
+      runtime.lastOffers.clear();
+      runtime.recentOffers.clear();
+      runtime.pendingPick = null;
+      runtime.selectedRow = null;
+      runtime.optimizer?.clearCache();
+      runtime.persistedPicks.clear();
+      runtime.pickOrder = 0;
+      safeSessionRemove(PICKS_KEY);
+      runtime.emptyTraySince = 0;
+      return trayState;
+    }
+    runtime.emptyTraySince = 0;
+
+    let changed = false;
+    const visibleNames = new Set(trayState.slots.values());
+    for (const name of [...runtime.tracked.keys()]) {
+      if (!visibleNames.has(name)) {
+        runtime.tracked.delete(name);
+        changed = true;
+      }
+    }
+
+    for (const [position, name] of trayState.slots) {
+      let tracked = runtime.tracked.get(name);
+      if (!tracked) {
+        const restored = runtime.persistedPicks.get(name);
+        let row =
+          restored?.row ||
+          runtime.lastOffers.get(name) ||
+          runtime.recentOffers.get(name);
+        if (!row && runtime.selectedRow?.player === name)
+          row = runtime.selectedRow;
+        if (!row) {
+          const candidates = runtime.rowsByName.get(name) || [];
+          if (candidates.length === 1) row = candidates[0];
+        }
+        if (row) {
+          tracked = {
+            row,
+            position,
+            originalPosition: restored?.originalPosition || position,
+            order: restored?.order || ++runtime.pickOrder,
+          };
+          runtime.tracked.set(name, tracked);
+          changed = true;
+        }
+      }
+      if (tracked && tracked.position !== position) {
+        tracked.position = position;
+        changed = true;
+      }
+    }
+    if (changed) persistTrackedPicks();
+    return trayState;
+  }
+
+  function currentEntries(trayState) {
+    const entries = [];
+    for (const [position, name] of trayState.slots) {
+      const tracked = runtime.tracked.get(name);
+      if (tracked?.row) entries.push({ row: tracked.row, position });
+    }
+    return entries;
+  }
+
+  function occupiedMask(entries) {
+    let mask = 0;
+    for (const entry of entries) mask |= 1 << POSITION_INDEX[entry.position];
+    return mask;
+  }
+
+  function compareActions(left, right) {
+    if (!right) return 1;
+    if (Math.abs(left.ceiling.raw - right.ceiling.raw) > EPSILON) {
+      return left.ceiling.raw > right.ceiling.raw ? 1 : -1;
+    }
+    const leftImmediate = left.immediate?.raw ?? 0;
+    const rightImmediate = right.immediate?.raw ?? 0;
+    if (Math.abs(leftImmediate - rightImmediate) > EPSILON) {
+      return leftImmediate > rightImmediate ? 1 : -1;
+    }
+    const leftMoves = left.moves?.length || 0;
+    const rightMoves = right.moves?.length || 0;
+    if (leftMoves !== rightMoves) return leftMoves < rightMoves ? 1 : -1;
+    if (left.row.player !== right.row.player) {
+      return right.row.player.localeCompare(left.row.player);
+    }
+    return (
+      (POSITION_INDEX[right.position] ?? 5) -
+      (POSITION_INDEX[left.position] ?? 5)
+    );
+  }
+
+  function evaluateCell(cell, entries, withPlans = true) {
+    const fixedRows = entries.map((entry) => entry.row);
+    const usedNames = new Set(fixedRows.map((row) => row.player));
+    const states = reachableRosterStates(entries);
+    const rows = runtime.byCell.get(`${cell.team}|${cell.era}`) || [];
+    let best = null;
+    const actions = [];
+
+    for (const row of rows) {
+      if (usedNames.has(row.player)) continue;
+      let ceiling = runtime.optimizer.relaxedCeiling(
+        [...fixedRows, row],
+        false,
+      );
+      if (!ceiling) continue;
+      let plan = shortestPlacementPlan(states, row, ceiling.occupiedMask);
+
+      // Defensive fallback: score every reachable occupied mask if a future site
+      // movement-rule change makes the relaxed optimum unreachable.
+      if (!plan) {
+        const placements = new Map();
+        for (const state of states) {
+          const candidate = shortestPlacementPlan([state], row);
+          if (!candidate) continue;
+          const prior = placements.get(candidate.postMask);
+          if (!prior || candidate.moves.length < prior.moves.length) {
+            placements.set(candidate.postMask, candidate);
+          }
+        }
+        ceiling = null;
+        for (const candidate of placements.values()) {
+          const result = runtime.optimizer.ceilingForMask(
+            [...fixedRows, row],
+            candidate.postMask,
+            false,
+          );
+          if (result && (!ceiling || result.raw > ceiling.raw + EPSILON)) {
+            ceiling = result;
+            plan = candidate;
+          }
+        }
+      }
+      if (!ceiling || !plan) continue;
+      const action = {
+        row,
+        position: plan.position,
+        moves: withPlans ? plan.moves : [],
+        ceiling,
+        immediate: calculateTeamResult([...fixedRows, row]),
+      };
+      actions.push(action);
+      if (compareActions(action, best) > 0) best = action;
+    }
+    return { cell, best, actions };
+  }
+
+  function studioOpenMask() {
+    let openMask = FULL_POSITION_MASK;
+    const ordered = [...runtime.tracked.values()].sort(
+      (left, right) => finiteNumber(left.order) - finiteNumber(right.order),
+    );
+    for (const tracked of ordered) {
+      const requestedBit = 1 << POSITION_INDEX[tracked.originalPosition];
+      let consumedBit =
+        requestedBit & openMask & tracked.row.posMask ? requestedBit : 0;
+      if (!consumedBit) {
+        for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+          const bit = 1 << positionIndex;
+          if (bit & openMask & tracked.row.posMask) {
+            consumedBit = bit;
+            break;
+          }
+        }
+      }
+      if (!consumedBit) consumedBit = openMask & -openMask;
+      openMask &= ~consumedBit;
+    }
+    return openMask;
+  }
+
+  function feasibleOccupiedMasks(rows) {
+    const masks = new Set();
+    const sorted = [...rows].sort(
+      (left, right) => popcount(left.posMask) - popcount(right.posMask),
+    );
+    const visit = (index, mask) => {
+      if (index === sorted.length) {
+        masks.add(mask);
+        return;
+      }
+      const row = sorted[index];
+      for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+        const bit = 1 << positionIndex;
+        if (!(row.posMask & bit) || mask & bit) continue;
+        visit(index + 1, mask | bit);
+      }
+    };
+    visit(0, 0);
+    return [...masks];
+  }
+
+  function scenarioRowValue(row, spgCount, bpgCount) {
+    return (
+      COEFF_PPG * row.ppg +
+      COEFF_RPG * row.rpg +
+      COEFF_APG * row.apg +
+      COEFF_SPG[spgCount] * row.spg +
+      COEFF_BPG[bpgCount] * row.bpg
+    );
+  }
+
+  function bestUniquePoolCombination(lists) {
+    const order = lists
+      .map((list, index) => ({ list, index }))
+      .sort((left, right) => left.list.length - right.list.length);
+    const suffixUpper = Array(order.length + 1).fill(0);
+    for (let index = order.length - 1; index >= 0; index -= 1) {
+      suffixUpper[index] = suffixUpper[index + 1] + order[index].list[0].value;
+    }
+    const usedNames = new Set();
+    const selected = Array(lists.length);
+    let bestValue = Number.NEGATIVE_INFINITY;
+    let bestRows = null;
+
+    const visit = (index, value) => {
+      if (value + suffixUpper[index] <= bestValue + EPSILON) return;
+      if (index === order.length) {
+        bestValue = value;
+        bestRows = [...selected];
+        return;
+      }
+      const { list, index: originalIndex } = order[index];
+      for (const candidate of list) {
+        if (usedNames.has(candidate.row.nameId)) continue;
+        usedNames.add(candidate.row.nameId);
+        selected[originalIndex] = candidate.row;
+        visit(index + 1, value + candidate.value);
+        usedNames.delete(candidate.row.nameId);
+      }
+    };
+    visit(0, 0);
+    return bestRows ? { value: bestValue, rows: bestRows } : null;
+  }
+
+  function evaluatePlannerPools(fixedRows, pools, cache) {
+    const cacheKey = pools.map((pool) => pool.key).join(">");
+    if (cache.has(cacheKey)) return cache.get(cacheKey);
+    const fixedNames = new Set(fixedRows.map((row) => row.nameId));
+    const fixedSpg = fixedRows.filter((row) => row.spg > 0).length;
+    const fixedBpg = fixedRows.filter((row) => row.bpg > 0).length;
+    const remainingCount = pools.length;
+    const availableSignatures = pools.map((pool) => [
+      ...new Set(pool.rows.map((row) => row.sig)),
+    ]);
+    const signatures = Array(remainingCount);
+    let best = null;
+
+    const evaluateSignatures = () => {
+      const spgCount =
+        fixedSpg + signatures.reduce((sum, sig) => sum + (sig & 1 ? 1 : 0), 0);
+      const bpgCount =
+        fixedBpg + signatures.reduce((sum, sig) => sum + (sig & 2 ? 1 : 0), 0);
+      const lists = [];
+      for (let poolIndex = 0; poolIndex < pools.length; poolIndex += 1) {
+        const byName = new Map();
+        for (const row of pools[poolIndex].rows) {
+          if (row.sig !== signatures[poolIndex] || fixedNames.has(row.nameId))
+            continue;
+          const value = scenarioRowValue(row, spgCount, bpgCount);
+          const previous = byName.get(row.nameId);
+          if (!previous || value > previous.value + EPSILON) {
+            byName.set(row.nameId, { row, value });
+          }
+        }
+        const list = [...byName.values()]
+          .sort((left, right) => right.value - left.value)
+          .slice(0, remainingCount);
+        if (!list.length) return;
+        lists.push(list);
+      }
+      const future = bestUniquePoolCombination(lists);
+      if (!future) return;
+      const fixedValue = fixedRows.reduce(
+        (sum, row) => sum + scenarioRowValue(row, spgCount, bpgCount),
+        0,
+      );
+      const raw = fixedValue + future.value;
+      if (!best || raw > best.raw + EPSILON) {
+        const rows = [...fixedRows, ...future.rows];
+        best = { raw: rawTeamScore(rows), futureRows: future.rows };
+      }
+    };
+
+    const visit = (index) => {
+      if (index === remainingCount) {
+        evaluateSignatures();
+        return;
+      }
+      for (const sig of availableSignatures[index]) {
+        signatures[index] = sig;
+        visit(index + 1);
+      }
+    };
+    visit(0);
+    cache.set(cacheKey, best);
+    return best;
+  }
+
+  function plannerRetryVariants(shadow) {
+    const sequences = [[]];
+    const team = shadow.remainingRespins("team") > 0;
+    const era = shadow.remainingRespins("era") > 0;
+    if (team) sequences.push(["team"]);
+    if (era) sequences.push(["era"]);
+    if (team && era) sequences.push(["team", "era"], ["era", "team"]);
+    const variants = [];
+    for (const sequence of sequences) {
+      const next = shadow.clone();
+      let valid = true;
+      for (const scope of sequence) {
+        if (next.remainingRespins(scope) <= 0) {
+          valid = false;
+          break;
+        }
+        const draw = next.respin(scope);
+        if (!draw) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid && next.current) variants.push({ shadow: next, sequence });
+    }
+    return variants;
+  }
+
+  function backendSlotForPick(shadow, requestedPosition, sessionPlayer) {
+    const compatible = (slot) =>
+      slot.positions.some((position) =>
+        sessionPlayer.positions.includes(position),
+      );
+    return (
+      shadow.openSlots.find(
+        (slot) => slot.id === requestedPosition && compatible(slot),
+      ) ||
+      shadow.openSlots.find(compatible) ||
+      shadow.openSlots[0] ||
+      null
+    );
+  }
+
+  function solveExactSeededPlan(entries) {
+    const sourceShadow = runtime.shadowSession;
+    if (!runtime.shadowReady || !runtime.shadowSynced || !sourceShadow?.current)
+      return null;
+    const fixedRows = entries.map((entry) => entry.row);
+    const remainingRounds = 5 - fixedRows.length;
+    if (remainingRounds <= 0) {
+      const result = calculateTeamResult(fixedRows);
+      return { result, first: null, nodes: 0 };
+    }
+
+    const fixedNames = new Set(fixedRows.map((row) => row.player));
+    const shadow = sourceShadow.clone();
+    shadow.placed = new Set(
+      [...shadow.placed].filter((id) => runtime.criticalStudioIds.has(id)),
+    );
+    const poolCache = new Map();
+    let best = null;
+    let nodes = 0;
+
+    const visit = (state, remainingUiMask, pools, steps) => {
+      nodes += 1;
+      if (!state.openSlots.length) {
+        if (pools.length !== remainingRounds) return;
+        const lineup = evaluatePlannerPools(fixedRows, pools, poolCache);
+        if (!lineup) return;
+        const result = calculateTeamResult([
+          ...fixedRows,
+          ...lineup.futureRows,
+        ]);
+        const retryCount = steps.reduce(
+          (sum, step) => sum + step.retries.length,
+          0,
+        );
+        if (
+          !best ||
+          result.raw > best.result.raw + EPSILON ||
+          (Math.abs(result.raw - best.result.raw) <= EPSILON &&
+            retryCount < best.retryCount)
+        ) {
+          best = {
+            result,
+            retryCount,
+            steps: steps.map((step, index) => ({
+              ...step,
+              row: lineup.futureRows[index],
+            })),
+          };
+        }
+        return;
+      }
+
+      for (const variant of plannerRetryVariants(state)) {
+        const cell = variant.shadow.current;
+        const cellRows = runtime.byCell.get(`${cell.team}|${cell.era}`) || [];
+        for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+          const bit = 1 << positionIndex;
+          if (!(remainingUiMask & bit)) continue;
+          const position = POSITIONS[positionIndex];
+          const effectGroups = new Map();
+          for (const row of cellRows) {
+            if (fixedNames.has(row.player) || !(row.posMask & bit)) continue;
+            const playerId = variant.shadow.resolvePlayerId(row);
+            const sessionPlayer = playerId
+              ? variant.shadow.index.byId.get(playerId)
+              : null;
+            if (!playerId || !sessionPlayer) continue;
+            const slot = backendSlotForPick(
+              variant.shadow,
+              position,
+              sessionPlayer,
+            );
+            if (!slot) continue;
+            const critical = runtime.criticalStudioIds.has(playerId);
+            const groupKey = critical
+              ? `critical:${playerId}`
+              : `slot:${slot.id}`;
+            let group = effectGroups.get(groupKey);
+            if (!group) {
+              group = {
+                rows: [],
+                representative: row,
+                playerId,
+                critical,
+                slotId: slot.id,
+              };
+              effectGroups.set(groupKey, group);
+            }
+            group.rows.push(row);
+          }
+
+          for (const [effectKey, group] of effectGroups) {
+            const next = variant.shadow.clone();
+            if (!next.recordPick(position, group.playerId)) continue;
+            if (!group.critical) next.placed.delete(group.playerId);
+            if (next.openSlots.length && !next.nextSpin()) continue;
+            const openMask = variant.shadow.openSlots.reduce(
+              (mask, slot) => mask | (1 << POSITION_INDEX[slot.id]),
+              0,
+            );
+            const pool = {
+              key: `${cell.team}|${cell.era}|${position}|${openMask}|${effectKey}`,
+              rows: group.rows,
+            };
+            visit(
+              next,
+              remainingUiMask & ~bit,
+              [...pools, pool],
+              [
+                ...steps,
+                {
+                  retries: variant.sequence,
+                  cell: { team: cell.team, era: cell.era },
+                  position,
+                  postMask: FULL_POSITION_MASK & ~(remainingUiMask & ~bit),
+                },
+              ],
+            );
+          }
+        }
+      }
+    };
+
+    const reachableMasks = new Set(
+      reachableRosterStates(entries).map((state) =>
+        state.slots.reduce(
+          (mask, row, positionIndex) => mask | (row ? 1 << positionIndex : 0),
+          0,
+        ),
+      ),
+    );
+    for (const occupied of reachableMasks) {
+      visit(shadow.clone(), FULL_POSITION_MASK & ~occupied, [], []);
+    }
+    if (!best) return null;
+    return {
+      result: best.result,
+      first: best.steps[0] || null,
+      steps: best.steps,
+      nodes,
+    };
+  }
+
+  function retryCells(scope, cell, entries) {
+    const placedIds = new Set(
+      [...runtime.tracked.values()].map((tracked) => tracked.row.id),
+    );
+    const openMask = studioOpenMask();
+    const cells = [];
+    for (const key of runtime.byCell.keys()) {
+      const [team, era] = key.split("|");
+      if (scope === "team" && (era !== cell.era || team === cell.team))
+        continue;
+      if (scope === "era" && (team !== cell.team || era === cell.era)) continue;
+      const hasLegal = runtime.byCell
+        .get(key)
+        .some(
+          (row) => !placedIds.has(row.id) && Boolean(row.posMask & openMask),
+        );
+      if (hasLegal) cells.push({ team, era });
+    }
+    return cells;
+  }
+
+  function summarizeRetry(scope, cell, entries) {
+    if (
+      runtime.shadowReady &&
+      runtime.shadowSynced &&
+      sameCell(runtime.shadowSession?.current, cell)
+    ) {
+      const shadow = runtime.shadowSession.clone();
+      const predicted = shadow.respin(scope);
+      if (!predicted) return null;
+      const predictedCell = { team: predicted.team, era: predicted.era };
+      const result = evaluateCell(predictedCell, entries, false);
+      const action = result.best;
+      const otherScope = scope === "team" ? "era" : "team";
+      let chain = null;
+      if (shadow.remainingRespins(otherScope) > 0) {
+        const chainedShadow = shadow.clone();
+        const chainedDraw = chainedShadow.respin(otherScope);
+        if (chainedDraw) {
+          const chainedCell = { team: chainedDraw.team, era: chainedDraw.era };
+          const chainedAction = evaluateCell(chainedCell, entries, false).best;
+          chain = {
+            scope: otherScope,
+            cell: chainedCell,
+            action: chainedAction || null,
+          };
+        }
+      }
+      const bestReachable =
+        chain?.action && (!action || compareActions(chain.action, action) > 0)
+          ? chain.action
+          : action;
+      const chainRecommended = Boolean(
+        chain?.action &&
+          ((!action?.ceiling.possible82 && chain.action.ceiling.possible82) ||
+            compareActions(chain.action, action) > 0),
+      );
+      return {
+        scope,
+        exact: true,
+        predictedCell,
+        chain,
+        chainRecommended,
+        outcomes: [{ cell: predictedCell, action: action || null }],
+        count: 1,
+        legalCount: action ? 1 : 0,
+        legalRate: action ? 1 : 0,
+        meanRaw: action?.ceiling.raw || 0,
+        meanScore: action?.ceiling.score || 0,
+        pathRate: action?.ceiling.possible82 ? 1 : 0,
+        best: action || null,
+        reachableLegal: Boolean(action || chain?.action),
+        reachablePath: Boolean(
+          action?.ceiling.possible82 || chain?.action?.ceiling.possible82,
+        ),
+        decisionRaw: bestReachable?.ceiling.raw || 0,
+        decisionScore: bestReachable?.ceiling.score || 0,
+      };
+    }
+
+    const cells = retryCells(scope, cell, entries);
+    const outcomes = [];
+    let legalCount = 0;
+    let totalRaw = 0;
+    let pathCount = 0;
+    for (const alternative of cells) {
+      const result = evaluateCell(alternative, entries, false);
+      if (!result.best) {
+        outcomes.push({ cell: alternative, action: null });
+        continue;
+      }
+      legalCount += 1;
+      totalRaw += result.best.ceiling.raw;
+      if (result.best.ceiling.possible82) pathCount += 1;
+      outcomes.push({ cell: alternative, action: result.best });
+    }
+    if (!cells.length) return null;
+    const meanRaw = totalRaw / cells.length;
+    const best = outcomes.reduce((winner, outcome) => {
+      const action = outcome.action;
+      return action && (!winner || compareActions(action, winner) > 0)
+        ? action
+        : winner;
+    }, null);
+    return {
+      scope,
+      outcomes,
+      count: cells.length,
+      legalCount,
+      legalRate: legalCount / cells.length,
+      meanRaw,
+      meanScore: roundOne(meanRaw),
+      pathRate: pathCount / cells.length,
+      best,
+    };
+  }
+
+  function normalizedButtonText(button) {
+    return (button?.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function findRetryButtons() {
+    const buttons = [...document.querySelectorAll("button")];
+    const team =
+      buttons.find(
+        (button) =>
+          normalizedButtonText(button) === "team" &&
+          String(button.className).includes("amber"),
+      ) ||
+      buttons.find((button) =>
+        String(button.className).includes("text-amber-400"),
+      ) ||
+      buttons.find(
+        (button) =>
+          normalizedButtonText(button) === "team" && isVisible(button),
+      );
+    const era =
+      buttons.find(
+        (button) =>
+          normalizedButtonText(button) === "era" &&
+          String(button.className).includes("purple"),
+      ) ||
+      buttons.find((button) =>
+        String(button.className).includes("text-purple-400"),
+      ) ||
+      buttons.find(
+        (button) => normalizedButtonText(button) === "era" && isVisible(button),
+      );
+    return {
+      team: {
+        element: team || null,
+        available: Boolean(team && !team.disabled),
+      },
+      era: { element: era || null, available: Boolean(era && !era.disabled) },
+    };
+  }
+
+  function chooseAdvice(
+    current,
+    teamRetry,
+    eraRetry,
+    retries,
+    priorCeiling,
+    openSlots,
+  ) {
+    const retryLegal = (retry) =>
+      retry?.reachableLegal ?? retry?.legalCount > 0;
+    const retryPath = (retry) => retry?.reachablePath ?? retry?.pathRate > 0;
+    const retryValue = (retry) => retry?.decisionRaw ?? retry?.meanRaw ?? 0;
+    const availableRetries = [
+      retries.team.available && teamRetry ? teamRetry : null,
+      retries.era.available && eraRetry ? eraRetry : null,
+    ].filter(retryLegal);
+    const bestRetry = availableRetries.reduce((winner, retry) => {
+      if (!winner) return retry;
+      if (Math.abs(retryValue(retry) - retryValue(winner)) > EPSILON) {
+        return retryValue(retry) > retryValue(winner) ? retry : winner;
+      }
+      if (Math.abs(retry.pathRate - winner.pathRate) > EPSILON) {
+        return retry.pathRate > winner.pathRate ? retry : winner;
+      }
+      return winner;
+    }, null);
+    const bestPathRetry = availableRetries
+      .filter(retryPath)
+      .reduce((winner, retry) => {
+        if (!winner) return retry;
+        const retryPathStrength = retry.exact
+          ? Number(retryPath(retry))
+          : retry.pathRate;
+        const winnerPathStrength = winner.exact
+          ? Number(retryPath(winner))
+          : winner.pathRate;
+        if (Math.abs(retryPathStrength - winnerPathStrength) > EPSILON) {
+          return retryPathStrength > winnerPathStrength ? retry : winner;
+        }
+        if (Math.abs(retryValue(retry) - retryValue(winner)) > EPSILON) {
+          return retryValue(retry) > retryValue(winner) ? retry : winner;
+        }
+        return winner;
+      }, null);
+
+    if (!current.best) {
+      if (bestRetry)
+        return {
+          kind: bestRetry.scope,
+          reason: "No legal player fits an open position.",
+        };
+      return { kind: "dead", reason: "No legal pick or retry is available." };
+    }
+
+    if (!bestRetry)
+      return { kind: "pick", reason: "This is the best legal ceiling." };
+    const slotsAfterPick = Math.max(0, openSlots - 1);
+    const saveMargin = slotsAfterPick === 0 ? 0 : 0.45 + 0.2 * slotsAfterPick;
+    const currentKeepsPath = current.best.ceiling.possible82;
+    const priorPossible = priorCeiling?.possible82;
+
+    if (priorPossible && !currentKeepsPath && bestPathRetry) {
+      return {
+        kind: bestPathRetry.scope,
+        reason: bestPathRetry.chainRecommended
+          ? `Every pick here loses 82-0. Use ${bestPathRetry.scope.toUpperCase()} retry, then ${bestPathRetry.chain.scope.toUpperCase()} retry.`
+          : "Every pick in this pool loses the 82-0 ceiling; retrying can preserve it.",
+      };
+    }
+
+    const expectedGain = retryValue(bestRetry) - current.best.ceiling.raw;
+    if (expectedGain > saveMargin + EPSILON) {
+      return {
+        kind: bestRetry.scope,
+        reason: bestRetry.chainRecommended
+          ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; that branch adds about ${expectedGain.toFixed(1)} ceiling points.`
+          : `The retry improves the ideal-future ceiling by about ${expectedGain.toFixed(1)} points.`,
+      };
+    }
+    return {
+      kind: "pick",
+      reason:
+        expectedGain > 0
+          ? "The small retry gain is not worth spending the retry this early."
+          : "Picking now has the stronger ceiling; save both retries.",
+    };
+  }
+
+  function clearHighlights() {
+    for (const element of document.querySelectorAll(
+      "[data-82coach-card],[data-82coach-locked],[data-82coach-position],[data-82coach-retry]",
+    )) {
+      element.removeAttribute("data-82coach-card");
+      element.removeAttribute("data-82coach-label");
+      element.removeAttribute("data-82coach-locked");
+      element.removeAttribute("data-82coach-position");
+      element.removeAttribute("data-82coach-retry");
+      element.style.removeProperty("--82coach-color");
+    }
+  }
+
+  function controlPosition(element) {
+    const texts = [
+      element.getAttribute?.("aria-label") || "",
+      ...[...(element.querySelectorAll?.("span") || [])].map((span) =>
+        span.textContent.trim(),
+      ),
+    ];
+    return (
+      POSITIONS.find((position) =>
+        texts.some(
+          (text) =>
+            text === position ||
+            new RegExp(`^${position}(?:\\s*:|\\b)`).test(text),
+        ),
+      ) || null
+    );
+  }
+
+  function controlHasPlayer(element) {
+    return [...element.querySelectorAll("p")].some((paragraph) =>
+      runtime.namesSet.has(paragraph.textContent.trim()),
+    );
+  }
+
+  function findPositionTargets(
+    position,
+    { includeTray = false, openOnly = true } = {},
+  ) {
+    const targets = new Set();
+    const court = document.querySelector('svg[viewBox="0 0 500 700"]');
+    const courtRoot = court?.parentElement?.parentElement;
+    if (courtRoot) {
+      for (const button of courtRoot.querySelectorAll("button")) {
+        if (
+          isVisible(button) &&
+          controlPosition(button) === position &&
+          (!openOnly || !controlHasPlayer(button))
+        ) {
+          targets.add(button);
+        }
+      }
+    }
+    const tray = includeTray
+      ? document.querySelector("[data-lineup-tray]")
+      : null;
+    if (tray && isVisible(tray)) {
+      for (const slot of tray.querySelectorAll('[role="button"]')) {
+        if (
+          isVisible(slot) &&
+          controlPosition(slot) === position &&
+          (!openOnly || !controlHasPlayer(slot))
+        ) {
+          targets.add(slot);
+        }
+      }
+    }
+    const sheet = document.querySelector('[data-slot="sheet-content"]');
+    if (sheet) {
+      for (const button of sheet.querySelectorAll("button")) {
+        if (
+          isVisible(button) &&
+          controlPosition(button) === position &&
+          (!openOnly || !controlHasPlayer(button))
+        ) {
+          targets.add(button);
+        }
+      }
+    }
+    return [...targets];
+  }
+
+  function applyHighlights(advice, cards, retries) {
+    clearHighlights();
+    const fallback = advice.current?.best;
+    const isRetry = advice.kind === "team" || advice.kind === "era";
+    const move = advice.kind === "pick" ? fallback?.moves?.[0] : null;
+    const overridden = runtime.safetyOverride === advice.cellSignature;
+    const shouldLock = (isRetry || move) && !overridden;
+
+    if (isRetry) {
+      retries[advice.kind]?.element?.setAttribute(
+        "data-82coach-retry",
+        advice.kind,
+      );
+    }
+
+    if (shouldLock) {
+      runtime.selectedRow = null;
+      runtime.pendingPick = null;
+      for (const { element } of cards)
+        element.setAttribute("data-82coach-locked", "true");
+      for (const position of POSITIONS) {
+        for (const target of findPositionTargets(position, {
+          includeTray: true,
+          openOnly: true,
+        })) {
+          if (!move || position !== move.to) {
+            target.setAttribute("data-82coach-locked", "true");
+          }
+        }
+      }
+    }
+
+    if (move) {
+      for (const position of [move.from, move.to]) {
+        for (const target of findPositionTargets(position, {
+          includeTray: true,
+          openOnly: false,
+        })) {
+          target.setAttribute("data-82coach-position", "true");
+        }
+      }
+      return;
+    }
+
+    if (!fallback) return;
+    const card = cards.find(
+      ({ row, element }) => row.key === fallback.row.key && isVisible(element),
+    )?.element;
+
+    if (card) {
+      card.setAttribute(
+        "data-82coach-card",
+        isRetry ? `fallback-${advice.kind}` : "pick",
+      );
+      card.setAttribute(
+        "data-82coach-label",
+        isRetry
+          ? `FALLBACK · ${fallback.position}`
+          : `PICK · ${fallback.position}`,
+      );
+      card.style.setProperty(
+        "--82coach-color",
+        isRetry ? COLORS[advice.kind] : COLORS.pick,
+      );
+    }
+
+    if (!isRetry) {
+      for (const target of findPositionTargets(fallback.position)) {
+        target.setAttribute("data-82coach-position", "true");
+      }
+    }
+  }
+
+  function scoreText(result) {
+    return `${result.score.toFixed(1)} · ${result.wins}-${result.losses}`;
+  }
+
+  function renderAdvice(advice, entries, cards, retries) {
+    const ui = readUiState();
+    const current = advice.current;
+    const best = current.best;
+    const seededResult = advice.seededPlan?.result || null;
+    const isRetry = advice.kind === "team" || advice.kind === "era";
+    const move = advice.kind === "pick" ? best?.moves?.[0] : null;
+    const retriesAvailable = retries.team.available || retries.era.available;
+    const retryCanRestorePath = Boolean(
+      (advice.teamRetry?.reachablePath ?? advice.teamRetry?.pathRate > 0) ||
+        (advice.eraRetry?.reachablePath ?? advice.eraRetry?.pathRate > 0),
+    );
+    const availableRetrySummaries = [
+      retries.team.available ? advice.teamRetry : null,
+      retries.era.available ? advice.eraRetry : null,
+    ].filter(Boolean);
+    const exactRetryTreeExhausted = Boolean(
+      retriesAvailable &&
+        availableRetrySummaries.length ===
+          Number(retries.team.available) + Number(retries.era.available) &&
+        availableRetrySummaries.every((retry) => retry.exact) &&
+        !retryCanRestorePath,
+    );
+    const impossible =
+      !runtime.modelMismatch &&
+      (seededResult
+        ? !seededResult.possible82
+        : advice.priorCeiling && !advice.priorCeiling.possible82);
+    const forcedImpossible =
+      !runtime.modelMismatch &&
+      !seededResult &&
+      !impossible &&
+      !best?.ceiling.possible82 &&
+      (!retriesAvailable || exactRetryTreeExhausted);
+    const atRisk =
+      !runtime.modelMismatch &&
+      !seededResult &&
+      !impossible &&
+      !forcedImpossible &&
+      !best?.ceiling.possible82 &&
+      retriesAvailable;
+    const statusColor = runtime.modelMismatch
+      ? COLORS.team
+      : impossible || forcedImpossible
+        ? COLORS.impossible
+        : atRisk
+          ? COLORS.team
+          : COLORS.pick;
+    const statusText = runtime.modelMismatch
+      ? "Site model changed — recommendations are provisional"
+      : impossible
+        ? seededResult
+          ? `82-0 impossible · exact seeded max ${seededResult.score.toFixed(1)}`
+          : `82-0 impossible · absolute max ${advice.priorCeiling.score.toFixed(1)}`
+        : forcedImpossible
+          ? `82-0 now impossible · best reachable max ${roundOne(
+              Math.max(
+                best?.ceiling.raw || 0,
+                ...availableRetrySummaries.map(
+                  (retry) => retry.decisionRaw || retry.meanRaw || 0,
+                ),
+              ),
+            ).toFixed(1)}`
+          : atRisk
+            ? retryCanRestorePath
+              ? "82-0 at risk · a retry is required"
+              : "82-0 at risk · no one-retry path found"
+            : seededResult
+              ? `82-0 achievable · exact seeded max ${seededResult.score.toFixed(1)}`
+              : `82-0 still possible · max ${advice.priorCeiling.score.toFixed(1)}`;
+    const actionColor = isRetry
+      ? COLORS[advice.kind]
+      : move
+        ? COLORS.position
+        : advice.kind === "pick"
+          ? COLORS.pick
+          : COLORS.impossible;
+    const eyebrow = move
+      ? "MOVE FIRST"
+      : advice.kind === "pick"
+        ? "PICK NOW"
+        : advice.kind === "team"
+          ? "TEAM RETRY"
+          : advice.kind === "era"
+            ? "ERA RETRY"
+            : "NO LEGAL ACTION";
+    const primary = move
+      ? `${move.player} · ${move.from}`
+      : isRetry
+        ? advice.kind === "team"
+          ? `Keep ${advice.cell.era} · reroll team`
+          : `Keep ${advice.cell.team} · reroll era`
+        : best?.row.player || "Retry unavailable";
+    const position = move
+      ? move.to
+      : advice.kind === "pick" && best
+        ? best.position
+        : "";
+    const safetyLocked =
+      (isRetry || move) && runtime.safetyOverride !== advice.cellSignature;
+    const pickedResult = calculateTeamResult(entries.map((entry) => entry.row));
+    const currentLine = best ? scoreText(best.ceiling) : "—";
+
+    const stats = best
+      ? `${best.row.ppg.toFixed(1)} PTS · ${best.row.rpg.toFixed(1)} REB · ${best.row.apg.toFixed(1)} AST · ${best.row.spg.toFixed(1)} STL · ${best.row.bpg.toFixed(1)} BLK`
+      : "";
+    const fallbackHtml =
+      isRetry && best
+        ? `<div class="fallback">Best fallback if you override: <strong>${escapeHtml(best.row.player)} → ${best.position}</strong><br>${escapeHtml(stats)}</div>`
+        : "";
+    const recommendedCardVisible = best
+      ? cards.some(
+          ({ row, element }) => row.key === best.row.key && isVisible(element),
+        )
+      : true;
+    const filterHint =
+      best && !recommendedCardVisible
+        ? `<div class="filter-hint">Clear search/filters to show <strong>${escapeHtml(best.row.player)}</strong>.</div>`
+        : "";
+    const formatRetry = (retry, available) => {
+      if (!retry) return available ? "no legal outcomes" : "used";
+      if (retry.exact) {
+        const cellText = `${retry.predictedCell.team} ${retry.predictedCell.era}`;
+        const direct = retry.legalCount
+          ? `${cellText} · ${retry.meanScore.toFixed(1)} · ${retry.pathRate ? "keeps 82 path" : "loses 82 path"}`
+          : `${cellText} · no legal UI pick`;
+        if (!retry.chainRecommended || advice.seededPlan) return direct;
+        const chained = retry.chain;
+        return `${direct}; then ${chained.scope.toUpperCase()} → ${chained.cell.team} ${chained.cell.era} · ${chained.action.ceiling.score.toFixed(1)}`;
+      }
+      return `${retry.meanScore.toFixed(1)} avg · ${Math.round(retry.pathRate * 100)}% keep path · ${Math.round(retry.legalRate * 100)}% legal`;
+    };
+    const teamForecast = formatRetry(advice.teamRetry, retries.team.available);
+    const eraForecast = formatRetry(advice.eraRetry, retries.era.available);
+    const chosenRetry =
+      advice.kind === "team"
+        ? advice.teamRetry
+        : advice.kind === "era"
+          ? advice.eraRetry
+          : null;
+    const actionMetric = chosenRetry
+      ? seededResult
+        ? scoreText(seededResult)
+        : chosenRetry.exact
+          ? `${(chosenRetry.chainRecommended ? chosenRetry.decisionScore : chosenRetry.meanScore).toFixed(1)} · ${(chosenRetry.reachablePath ?? chosenRetry.pathRate) ? "82 path" : "no 82 path"}`
+          : `${chosenRetry.meanScore.toFixed(1)} avg · ${Math.round(chosenRetry.pathRate * 100)}% path`
+      : currentLine;
+
+    const seededRoute = advice.seededPlan?.steps?.length
+      ? `<div class="route">
+          <div class="route-title">Optimal remaining route</div>
+          ${advice.seededPlan.steps
+            .map((step, index) => {
+              const retriesText = step.retries.length
+                ? `${step.retries.map((scope) => scope.toUpperCase()).join(" → ")} → `
+                : "PICK · ";
+              const cellText = step.cell
+                ? `${step.cell.team} ${step.cell.era} · `
+                : "";
+              return `<div class="route-step"><span>R${entries.length + index + 1}</span><strong>${escapeHtml(`${retriesText}${cellText}${step.row.player} → ${step.position}`)}</strong></div>`;
+            })
+            .join("")}
+          <div class="sub">Rechecked after every action.</div>
+        </div>`
+      : "";
+
+    const details = ui.details
+      ? `<div class="details">
+          <div class="row"><span>Picked team now</span><strong>${entries.length}/5 · ${scoreText(pickedResult)}</strong></div>
+          <div class="row"><span>Best current-pool ceiling</span><strong>${escapeHtml(currentLine)}</strong></div>
+          ${seededResult ? `<div class="row"><span>Exact seeded final maximum</span><strong>${escapeHtml(scoreText(seededResult))}</strong></div>` : ""}
+          <div class="row"><span>Team retry forecast</span><strong>${escapeHtml(teamForecast)}</strong></div>
+          <div class="row"><span>Era retry forecast</span><strong>${escapeHtml(eraForecast)}</strong></div>
+          <div class="row"><span>Reason</span><strong>${escapeHtml(advice.reason)}</strong></div>
+          <div class="row"><span>Model</span><strong>${advice.seededPlan ? "Exact seeded full draft" : runtime.shadowReady && runtime.shadowSynced ? "Exact seeded retries" : "Conditional retry forecast"} · ${MODEL_VERIFIED}</strong></div>
+          ${seededRoute}
+          <div class="legend">
+            <span class="swatch" style="--c:${COLORS.pick}">pick</span>
+            <span class="swatch" style="--c:${COLORS.team}">team retry</span>
+            <span class="swatch" style="--c:${COLORS.era}">era retry</span>
+            <span class="swatch" style="--c:${COLORS.position}">position</span>
+            <span class="swatch" style="--c:${COLORS.impossible}">impossible</span>
+          </div>
+        </div>`
+      : "";
+
+    const remainingAfterAction = POSITIONS.filter((openPosition) => {
+      const bit = 1 << POSITION_INDEX[openPosition];
+      if (occupiedMask(entries) & bit) return false;
+      return advice.kind !== "pick" || move || openPosition !== best?.position;
+    });
+    const subline = move
+      ? `Then pick ${best.row.player} → ${best.position}`
+      : isRetry
+        ? advice.reason
+        : stats;
+    const html = `
+      <div class="status" style="--status:${statusColor}"><span class="dot"></span><span>${escapeHtml(statusText)}</span></div>
+      <div class="action" style="--action:${actionColor}">
+        <div class="eyebrow">${eyebrow}</div>
+        <div class="primary"><span class="name">${escapeHtml(primary)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
+        <div class="sub">${escapeHtml(subline)}</div>
+        <div class="metrics"><span>${seededResult ? "Exact seeded final" : isRetry ? "Retry forecast" : "Ideal-future ceiling"}</span><strong>${escapeHtml(actionMetric)}</strong><span>${advice.kind === "pick" && !move ? "Open after pick" : "Open positions"}</span><strong>${escapeHtml(remainingAfterAction.join(" · ") || "Complete")}</strong></div>
+      </div>
+      ${fallbackHtml}
+      ${filterHint}
+      ${safetyLocked ? `<div class="safety"><span>🔒</span><span class="safety-copy">${move ? "Picks locked — make the highlighted move." : "Picks locked — use the highlighted retry."}</span><button class="unlock" id="unlock-picks">Pick anyway</button></div>` : ""}
+      <button class="details-toggle" id="details-toggle">${ui.details ? "Hide details" : "Why this choice?"}</button>
+      ${details}
+    `;
+
+    const signature = JSON.stringify({
+      version: VERSION,
+      kind: advice.kind,
+      cell: advice.cellSignature,
+      player: best?.row.key,
+      position: best?.position,
+      move: move ? `${move.player}:${move.from}:${move.to}` : "",
+      impossible,
+      forcedImpossible,
+      seeded: seededResult?.raw,
+      mismatch: runtime.modelMismatch,
+      details: ui.details,
+      override: runtime.safetyOverride,
+      team: teamForecast,
+      era: eraForecast,
+    });
+    renderPanel(html, signature);
+    applyHighlights(advice, cards, retries);
+  }
+
+  function findResultButton() {
+    return (
+      [...document.querySelectorAll("button,a")].find((element) =>
+        /^build another(?: team)?$/i.test((element.textContent || "").trim()),
+      ) || null
+    );
+  }
+
+  function renderResultsIfPresent() {
+    const resultButton = findResultButton();
+    if (!resultButton) return false;
+    clearHighlights();
+    const rows = [...runtime.tracked.values()].map((tracked) => tracked.row);
+    if (rows.length !== 5) {
+      renderPanel(
+        '<div class="loading">Final screen detected. The coach missed a pick; start the next game and it will resync automatically.</div>',
+        `result-missing:${rows.length}`,
+      );
+      return true;
+    }
+    const result = calculateTeamResult(rows);
+    const color = result.possible82 ? COLORS.pick : COLORS.impossible;
+    renderPanel(
+      `<div class="status" style="--status:${color}"><span class="dot"></span><span>${result.possible82 ? "82-0 achieved" : "Final team"}</span></div>
+       <div class="action" style="--action:${color}"><div class="eyebrow">FINAL RESULT</div><div class="primary"><span class="name">${result.wins}-${result.losses}</span><span class="arrow">·</span><span class="position">${result.score.toFixed(1)}</span></div><div class="sub">Exact recomputation from all five selected peaks.</div></div>`,
+      `result:${result.score}:${result.wins}:${runtime.mode}`,
+    );
+    checkModelDrift(result);
+    return true;
+  }
+
+  function checkModelDrift(calculated) {
+    if (runtime.mode === "1v1" || runtime.modelMismatch) return;
+    const candidates = [];
+    for (const element of document.querySelectorAll("span,p")) {
+      const text = directText(element);
+      const match = text.match(/(?:^|·\s*)([\d,.]+)\s*pts\s*$/i);
+      if (!match) continue;
+      const value = Number(match[1].replaceAll(",", ""));
+      if (Number.isFinite(value) && value >= 0 && value <= 200)
+        candidates.push(value);
+    }
+    if (candidates.length !== 1) return;
+    const displayed = candidates[0];
+    if (Math.abs(displayed - calculated.score) <= 0.11) {
+      runtime.resultMismatchCandidate = null;
+      return;
+    }
+    if (runtime.resultMismatchCandidate === displayed) {
+      runtime.modelMismatch = true;
+      safeSessionSet(MISMATCH_KEY, "1");
+      runtime.lastAdviceSignature = "";
+      scheduleScan(0);
+    } else {
+      runtime.resultMismatchCandidate = displayed;
+      scheduleScan(300);
+    }
+  }
+
+  function detectModeFromPage() {
+    const queryMode = new URLSearchParams(location.search).get("play");
+    if (queryMode === "hoopiq") setMode("hoopiq");
+    if (queryMode === "classic") setMode("classic");
+    const bodyText = document.body?.innerText || "";
+    if (/\bHOOP\s*IQ\b/i.test(bodyText) && getPlayerListRoot())
+      setMode("hoopiq");
+    if (
+      /finding an opponent|coin flip|you pick first|opponent is picking/i.test(
+        bodyText,
+      )
+    )
+      setMode("1v1");
+  }
+
+  function resetRuntime(mode) {
+    runtime.tracked.clear();
+    runtime.lastOffers.clear();
+    runtime.recentOffers.clear();
+    runtime.selectedRow = null;
+    runtime.pendingPick = null;
+    runtime.lastCell = null;
+    runtime.lastAdvice = null;
+    runtime.lastAnalysisKey = "";
+    runtime.lastAnalysis = null;
+    runtime.analysisInProgressKey = "";
+    runtime.safetyOverride = null;
+    runtime.lastAdviceSignature = "";
+    runtime.persistedPicks.clear();
+    runtime.pickOrder = 0;
+    runtime.emptyTraySince = 0;
+    runtime.sessionPayload = null;
+    runtime.shadowSession = null;
+    runtime.shadowReady = false;
+    runtime.shadowSynced = false;
+    runtime.shadowError = null;
+    runtime.shadowPendingCell = null;
+    runtime.shadowPendingFrom = null;
+    runtime.criticalStudioIds = new Set();
+    safeSessionRemove(PICKS_KEY);
+    runtime.optimizer?.clearCache();
+    if (mode) setMode(mode);
+  }
+
+  function inferPositionTarget(target) {
+    const button = target.closest?.('button,[role="button"]');
+    if (!button) return null;
+    return controlPosition(button);
+  }
+
+  function interactionGuard(event) {
+    const advice = runtime.lastAdvice;
+    const isRetry = advice && (advice.kind === "team" || advice.kind === "era");
+    const needsMove =
+      advice?.kind === "pick" && advice.current?.best?.moves?.length > 0;
+    const analysisLocked = Boolean(runtime.analysisInProgressKey);
+    if (
+      (!isRetry && !needsMove && !analysisLocked) ||
+      (!analysisLocked && runtime.safetyOverride === advice?.cellSignature)
+    )
+      return false;
+    const locked = event
+      .composedPath?.()
+      .some(
+        (node) =>
+          node instanceof Element &&
+          node.getAttribute("data-82coach-locked") === "true",
+      );
+    if (!locked && !analysisLocked) return false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    return true;
+  }
+
+  function handleDocumentClick(event) {
+    if (interactionGuard(event)) return;
+    const button = event.target.closest?.("button,a");
+    const text = (button?.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    if (text.includes("play 1v1")) resetRuntime("1v1");
+    else if (text.includes("play hoop") || text === "hoop iq")
+      resetRuntime("hoopiq");
+    else if (text.includes("play classic") || text === "classic")
+      resetRuntime("classic");
+    else if (/^build another(?: team)?$/.test(text)) resetRuntime(runtime.mode);
+
+    const retryButtons = findRetryButtons();
+    if (
+      button &&
+      (button === retryButtons.team.element ||
+        button === retryButtons.era.element)
+    ) {
+      commitShadowRetry(button === retryButtons.team.element ? "team" : "era");
+      runtime.selectedRow = null;
+      runtime.pendingPick = null;
+      runtime.safetyOverride = null;
+      runtime.lastAnalysisKey = "";
+      runtime.lastAnalysis = null;
+      scheduleScan(80);
+      return;
+    }
+
+    const cardElement = event.target.closest?.("div[draggable]");
+    const cardRow = rowFromCard(cardElement);
+    if (cardRow) runtime.selectedRow = cardRow;
+
+    const position = inferPositionTarget(event.target);
+    if (
+      position &&
+      runtime.selectedRow &&
+      runtime.selectedRow.positions.includes(position) &&
+      ![...parseTray().slots.keys()].includes(position)
+    ) {
+      runtime.pendingPick = {
+        row: runtime.selectedRow,
+        position,
+        time: Date.now(),
+      };
+      scheduleScan(80);
+    }
+  }
+
+  function handleDragStart(event) {
+    if (interactionGuard(event)) return;
+    const row = rowFromCard(event.target.closest?.("div[draggable]"));
+    if (row) runtime.selectedRow = row;
+  }
+
+  function handleDrop(event) {
+    if (interactionGuard(event)) return;
+    const position = inferPositionTarget(event.target);
+    if (position && runtime.selectedRow?.positions.includes(position)) {
+      runtime.pendingPick = {
+        row: runtime.selectedRow,
+        position,
+        time: Date.now(),
+      };
+      scheduleScan(80);
+    }
+  }
+
+  function handleKeydown(event) {
+    if (event.altKey && event.key.toLowerCase() === "a") {
+      const state = readUiState();
+      state.hidden = false;
+      state.collapsed = !state.collapsed;
+      writeUiState(state);
+      const host = getPanel();
+      host.shadowRoot.getElementById("card").classList.toggle("hidden", false);
+      host.shadowRoot
+        .getElementById("card")
+        .classList.toggle("collapsed", state.collapsed);
+      host.shadowRoot.getElementById("collapse").textContent = state.collapsed
+        ? "+"
+        : "—";
+      event.preventDefault();
+    }
+  }
+
+  function scheduleScan(delay = 140) {
+    clearTimeout(runtime.scanTimer);
+    runtime.scanTimer = window.setTimeout(scan, delay);
+  }
+
+  function scan() {
+    runtime.scanSerial += 1;
+    detectModeFromPage();
+    if (!runtime.dataReady) {
+      renderLoading(
+        runtime.loadError || "Loading player peaks and exact optimizer…",
+        Boolean(runtime.loadError),
+      );
+      return;
+    }
+
+    const trayState = reconcileRoster();
+    if (renderResultsIfPresent()) return;
+
+    const cards = findCards();
+    const cell = parseCell(cards);
+    if (!cell || !getPlayerListRoot() || !trayState.present) {
+      clearHighlights();
+      const waiting = /spinning|respinning/i.test(
+        document.body?.innerText || "",
+      )
+        ? "Waiting for the roll…"
+        : "Coach ready — start Classic, Hoop IQ, or 1v1.";
+      renderPanel(
+        `<div class="loading">${escapeHtml(waiting)}</div>`,
+        `idle:${waiting}:${runtime.mode}`,
+      );
+      return;
+    }
+
+    if (
+      runtime.lastCell &&
+      (runtime.lastCell.team !== cell.team || runtime.lastCell.era !== cell.era)
+    ) {
+      runtime.selectedRow = null;
+      runtime.pendingPick = null;
+      runtime.safetyOverride = null;
+      runtime.lastAdvice = null;
+      runtime.lastAnalysisKey = "";
+      runtime.lastAnalysis = null;
+      runtime.analysisInProgressKey = "";
+    }
+    runtime.lastCell = cell;
+    const cellRows = runtime.byCell.get(`${cell.team}|${cell.era}`) || [];
+    runtime.lastOffers = new Map(cellRows.map((row) => [row.player, row]));
+    for (const row of cellRows) runtime.recentOffers.set(row.player, row);
+    if (runtime.recentOffers.size > 700) runtime.recentOffers.clear();
+
+    const entries = currentEntries(trayState);
+    if (entries.length !== trayState.slots.size) {
+      renderLoading("Syncing your previously selected peaks…");
+      return;
+    }
+    const openMask = FULL_POSITION_MASK & ~occupiedMask(entries);
+    if (!openMask) return;
+
+    const retries = findRetryButtons();
+    const shadowState = syncShadowToCell(cell);
+    if (shadowState === "waiting") {
+      lockForAnalysis(cards, retries);
+      return;
+    }
+    const analysisKey = `${cell.team}|${cell.era}|${entries
+      .map((entry) => `${entry.row.key}@${entry.position}`)
+      .sort()
+      .join(
+        ";",
+      )}|${retries.team.available ? 1 : 0}|${retries.era.available ? 1 : 0}|${
+      runtime.shadowSynced && runtime.shadowSession
+        ? `seed:${runtime.shadowSession.sessionId}:${runtime.shadowSession.rng.state}`
+        : "forecast"
+    }`;
+    let analysis =
+      runtime.lastAnalysisKey === analysisKey ? runtime.lastAnalysis : null;
+    if (!analysis) {
+      lockForAnalysis(cards, retries);
+      runtime.lastAdvice = null;
+      if (runtime.analysisInProgressKey !== analysisKey) {
+        runtime.analysisInProgressKey = analysisKey;
+        requestAnimationFrame(() => {
+          window.setTimeout(() => {
+            if (runtime.analysisInProgressKey !== analysisKey) return;
+            try {
+              const completed = {
+                current: evaluateCell(cell, entries),
+                teamRetry: retries.team.available
+                  ? summarizeRetry("team", cell, entries)
+                  : null,
+                eraRetry: retries.era.available
+                  ? summarizeRetry("era", cell, entries)
+                  : null,
+                priorCeiling: runtime.optimizer.relaxedCeiling(
+                  entries.map((entry) => entry.row),
+                ),
+                seededPlan:
+                  runtime.shadowReady && runtime.shadowSynced
+                    ? solveExactSeededPlan(entries)
+                    : null,
+              };
+              if (runtime.analysisInProgressKey !== analysisKey) return;
+              runtime.lastAnalysisKey = analysisKey;
+              runtime.lastAnalysis = completed;
+            } catch (error) {
+              console.error("[82-0 Coach] Analysis failed", error);
+              runtime.loadError = `Analysis failed: ${error.message || error}`;
+            } finally {
+              if (runtime.analysisInProgressKey === analysisKey) {
+                runtime.analysisInProgressKey = "";
+                scheduleScan(0);
+              }
+            }
+          }, 0);
+        });
+      }
+      return;
+    }
+    let { current } = analysis;
+    const { teamRetry, eraRetry, priorCeiling, seededPlan } = analysis;
+    let decision = null;
+    if (seededPlan?.first) {
+      if (seededPlan.first.retries.length) {
+        const firstRetry = seededPlan.first.retries[0];
+        decision = {
+          kind: firstRetry,
+          reason: `The exact seeded optimum is ${scoreText(seededPlan.result)} and starts with ${firstRetry.toUpperCase()} retry${seededPlan.first.retries.length > 1 ? `, then ${seededPlan.first.retries[1].toUpperCase()} retry` : ""}.`,
+        };
+      } else {
+        const placement = shortestPlacementPlan(
+          reachableRosterStates(entries),
+          seededPlan.first.row,
+          seededPlan.first.postMask,
+          seededPlan.first.position,
+        );
+        if (placement) {
+          current = {
+            ...current,
+            best: {
+              row: seededPlan.first.row,
+              position: seededPlan.first.position,
+              moves: placement.moves,
+              ceiling: seededPlan.result,
+              immediate: calculateTeamResult([
+                ...entries.map((entry) => entry.row),
+                seededPlan.first.row,
+              ]),
+              seeded: true,
+            },
+          };
+          decision = {
+            kind: "pick",
+            reason: `This pick leads to the exact seeded maximum: ${scoreText(seededPlan.result)}.`,
+          };
+        }
+      }
+    }
+    if (!decision)
+      decision = chooseAdvice(
+        current,
+        teamRetry,
+        eraRetry,
+        retries,
+        priorCeiling,
+        popcount(openMask),
+      );
+    const cellSignature = `${cell.team}|${cell.era}|${entries
+      .map((entry) => `${entry.row.key}@${entry.position}`)
+      .sort()
+      .join(";")}|${decision.kind}`;
+    const advice = {
+      ...decision,
+      cell,
+      cellSignature,
+      current,
+      teamRetry,
+      eraRetry,
+      priorCeiling,
+      seededPlan,
+    };
+    runtime.lastAdvice = advice;
+    renderAdvice(advice, entries, cards, retries);
+  }
+
+  function bootstrap() {
+    installSiteStyles();
+    getPanel();
+    document.addEventListener("click", handleDocumentClick, true);
+    document.addEventListener("dragstart", handleDragStart, true);
+    document.addEventListener("drop", handleDrop, true);
+    document.addEventListener("keydown", handleKeydown, true);
+    const observer = new MutationObserver(() => scheduleScan());
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+
+    renderLoading("Loading player peaks and exact optimizer…");
+    loadRows()
+      .then(() => scheduleScan(0))
+      .catch((error) => {
+        console.error("[82-0 Coach] Failed to load player data", error);
+        runtime.loadError = `Could not load player data: ${error.message || error}`;
+        scheduleScan(0);
+      });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootstrap, { once: true });
+  } else {
+    bootstrap();
+  }
+})();
