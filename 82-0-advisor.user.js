@@ -3,7 +3,7 @@
 // @namespace    https://82-0.com/
 // @version      1.2.0
 // @description  Exact seeded draft planning, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
-// @author       Codex
+// @author       Intellectual07
 // @match        https://82-0.com/*
 // @match        https://www.82-0.com/*
 // @run-at       document-start
