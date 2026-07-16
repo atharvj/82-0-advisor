@@ -19,9 +19,3 @@ Starting a new game lets the coach read that game's seed and calculate the exact
 - Red: 82-0 is impossible; the coach still shows the highest-scoring route
 
 Open **Why this choice?** to see the exact maximum, retry forecasts, and planned remaining route. Press `Alt+A` to hide or restore the coach.
-
-## Test
-
-```bash
-node tests/core.test.js
-```
