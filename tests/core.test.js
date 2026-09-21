@@ -8,6 +8,7 @@ const {
   normalizeDataset,
   calculateTeamResult,
   projectedWins,
+  bestRolloutSequenceRaw,
   reachableRosterStates,
   shortestPlacementPlan,
   MulberryRng,
@@ -21,12 +22,17 @@ function row(player, team, era, positions, ppg, rpg, apg, spg, bpg) {
   return { player, team, era, positions, ppg, rpg, apg, spg, bpg };
 }
 
-assert.equal(TARGET_SCORE, 109.5);
-assert.equal(projectedWins(109.4), 81, "109.4 must remain an 81-win score");
+assert.equal(TARGET_SCORE, 115.4);
+assert.equal(projectedWins(115.3), 81, "115.3 must remain an 81-win score");
 assert.equal(
-  projectedWins(109.5),
+  projectedWins(115.4),
   82,
-  "109.5 is the first displayed 82-win score",
+  "115.4 is the first displayed 82-win score",
+);
+assert.equal(
+  projectedWins(91.3),
+  62,
+  "record projection must match the current production server",
 );
 
 const knownMaximum = [
@@ -39,6 +45,31 @@ const knownMaximum = [
 const maximumResult = calculateTeamResult(knownMaximum);
 assert.equal(maximumResult.score, 139.4);
 assert.equal(maximumResult.wins, 82);
+
+const rolloutData = normalizeDataset([
+  row("Fixed PG", "AAA", "2020s", ["PG"], 10, 2, 5, 1, 0.1),
+  row("Shared Star", "BBB", "2020s", ["SG", "SF"], 30, 5, 5, 1, 1),
+  row("Backup SG", "BBB", "2020s", ["SG"], 18, 3, 3, 1, 0.2),
+  row("Shared Star", "CCC", "2020s", ["SG", "SF"], 29, 5, 5, 1, 1),
+  row("Backup SF", "CCC", "2020s", ["SF"], 17, 4, 3, 1, 0.3),
+]);
+const [fixedPg, sharedOne, backupSg, sharedTwo, backupSf] = rolloutData.rows;
+const rolloutRaw = bestRolloutSequenceRaw(
+  [fixedPg],
+  1 << 0,
+  [
+    [sharedOne, backupSg],
+    [sharedTwo, backupSf],
+  ],
+);
+assert.equal(
+  rolloutRaw,
+  Math.max(
+    calculateTeamResult([fixedPg, sharedOne, backupSf]).raw,
+    calculateTeamResult([fixedPg, backupSg, sharedTwo]).raw,
+  ),
+  "rollout search must enforce unique player names across future cells",
+);
 
 const eliteStealsOnly = calculateTeamResult([
   row("A", "AAA", "2020s", ["PG"], 0, 0, 0, 3, 0),

@@ -8,7 +8,7 @@ A userscript for [82-0](https://82-0.com/) that recommends the best player, exac
 2. Create a new userscript and paste in [`82-0-advisor.user.js`](./82-0-advisor.user.js).
 3. Save it, refresh 82-0, and start a new game.
 
-Starting a new game lets the coach read that game's seed and calculate the exact best remaining route.
+The current site deals future rolls from its server and no longer exposes them in advance. The coach exactly optimizes the visible pool, position assignment, and lineup moves, then evaluates Team/Era retries against the remaining roll distribution. It keeps recalculating after every server-dealt roll because unrevealed future rolls cannot be known at the start anymore.
 
 ## Guide
 
@@ -18,4 +18,4 @@ Starting a new game lets the coach read that game's seed and calculate the exact
 - Purple: Era retry
 - Red: 82-0 is impossible; the coach still shows the highest-scoring route
 
-Open **Why this choice?** to see the exact maximum, retry forecasts, and planned remaining route. Press `Alt+A` to hide or restore the coach.
+Open **Why this choice?** to see the current ceiling and retry forecasts. Press `Alt+A` to hide or restore the coach.

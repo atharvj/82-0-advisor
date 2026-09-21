@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      1.2.0
-// @description  Exact seeded draft planning, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
+// @version      1.5.0
+// @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
+// @license      MIT
 // @match        https://82-0.com/*
 // @match        https://www.82-0.com/*
 // @run-at       document-start
@@ -13,17 +14,18 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.2.0";
-  const MODEL_VERIFIED = "2026-07-15";
+  const VERSION = "1.5.0";
+  const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
-  const DATA_URL = "/players_flat.json";
-  const DATA_CACHE_KEY = "nba_players_local_cache";
+  const DATASET_WAIT_MS = 15_000;
   const UI_KEY = "__82coach_ui_v1__";
   const MODE_KEY = "__82coach_mode_v1__";
   const MISMATCH_KEY = "__82coach_model_mismatch_v1__";
   const PICKS_KEY = "__82coach_picks_v1__";
   const PICKS_MAX_AGE = 6 * 60 * 60 * 1000;
+  const PENDING_PICK_MAX_AGE = 30_000;
+  const MAX_IDLE_RECOVERY_SCANS = 8;
 
   const POSITIONS = ["PG", "SG", "SF", "PF", "C"];
   const POSITION_INDEX = Object.freeze({ PG: 0, SG: 1, SF: 2, PF: 3, C: 4 });
@@ -37,8 +39,17 @@
     "2010s",
     "2020s",
   ]);
-  const TARGET_SCORE = 109.5;
+  // The live server maps a displayed team score to wins as
+  // round(82 * (score / 116)^1.15), capped at 82. Since team scores are
+  // displayed to one decimal, 115.4 is the first score that rounds to 82 wins.
+  const RECORD_SCORE_CAP = 116;
+  const TARGET_SCORE = 115.4;
   const EPSILON = 1e-10;
+  const ROLLOUT_CURRENT_SAMPLES = 16;
+  const ROLLOUT_RETRY_SAMPLES = 4;
+  const ROLLOUT_CURRENT_ACTIONS = 20;
+  const ROLLOUT_RETRY_ACTIONS = 8;
+  const ROLLOUT_ROWS_PER_POSITION = 3;
 
   // These are algebraically identical to the current production team formula.
   const COEFF_PPG = (100 * 0.46) / 133.4;
@@ -128,7 +139,11 @@
 
   function projectedWins(score) {
     return Math.round(
-      82 * Math.pow(Math.min(Math.max(score, 0) / 110, 1), 1.15),
+      82 *
+        Math.pow(
+          Math.min(Math.max(score, 0) / RECORD_SCORE_CAP, 1),
+          1.15,
+        ),
     );
   }
 
@@ -139,13 +154,82 @@
     return { raw, score, wins, losses: 82 - wins, possible82: wins === 82 };
   }
 
+  function rolloutRowValue(row) {
+    return (
+      COEFF_PPG * row.ppg +
+      COEFF_RPG * row.rpg +
+      COEFF_APG * row.apg +
+      COEFF_SPG[5] * row.spg +
+      COEFF_BPG[5] * row.bpg
+    );
+  }
+
+  // Scores one possible sequence of future server-dealt cells. The search is
+  // exact over the strongest few candidates at every open position; limiting
+  // each position keeps first-round forecasts fast enough for the live UI.
+  function bestRolloutSequenceRaw(
+    fixedRows,
+    occupied,
+    futurePools,
+    rowsPerPosition = ROLLOUT_ROWS_PER_POSITION,
+  ) {
+    if (!futurePools.length) return rawTeamScore(fixedRows);
+    const usedNames = new Set(fixedRows.map((row) => row.player));
+    const picked = [...fixedRows];
+    let bestRaw = Number.NEGATIVE_INFINITY;
+
+    const visit = (round, mask) => {
+      if (round === futurePools.length) {
+        bestRaw = Math.max(bestRaw, rawTeamScore(picked));
+        return;
+      }
+      const pool = futurePools[round] || [];
+      const candidates = [];
+      const seen = new Set();
+      for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+        const bit = 1 << positionIndex;
+        if (mask & bit) continue;
+        const strongest = pool
+          .filter(
+            (row) =>
+              row.posMask & bit && !usedNames.has(row.player),
+          )
+          .sort((left, right) => rolloutRowValue(right) - rolloutRowValue(left))
+          .slice(0, rowsPerPosition);
+        for (const row of strongest) {
+          const key = `${row.key}@${positionIndex}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({ row, bit });
+        }
+      }
+      for (const candidate of candidates) {
+        usedNames.add(candidate.row.player);
+        picked.push(candidate.row);
+        visit(round + 1, mask | candidate.bit);
+        picked.pop();
+        usedNames.delete(candidate.row.player);
+      }
+    };
+
+    visit(0, occupied);
+    return Number.isFinite(bestRaw) ? bestRaw : null;
+  }
+
   function normalizeDataset(rawRows) {
     const rows = [];
     const nameToId = new Map();
     const names = [];
+    const sourceRows = Array.isArray(rawRows)
+      ? rawRows
+      : Array.isArray(rawRows?.players)
+        ? rawRows.players
+        : [];
 
-    for (const source of Array.isArray(rawRows) ? rawRows : []) {
-      if (!source || !ERAS.has(source.era) || !source.player || !source.team)
+    for (const source of sourceRows) {
+      const player = source?.player || source?.name;
+      const stats = source?.stats || source;
+      if (!source || !ERAS.has(source.era) || !player || !source.team)
         continue;
       const positions = (
         Array.isArray(source.positions) ? source.positions : [source.pos]
@@ -153,30 +237,30 @@
       const posMask = positionMask(positions);
       if (!posMask) continue;
 
-      let nameId = nameToId.get(source.player);
+      let nameId = nameToId.get(player);
       if (nameId === undefined) {
         nameId = names.length;
-        nameToId.set(source.player, nameId);
-        names.push(source.player);
+        nameToId.set(player, nameId);
+        names.push(player);
       }
 
-      const spg = positiveNumber(source.spg);
-      const bpg = positiveNumber(source.bpg);
+      const spg = positiveNumber(stats.spg);
+      const bpg = positiveNumber(stats.bpg);
       rows.push({
-        player: String(source.player),
+        player: String(player),
         team: String(source.team),
         era: String(source.era),
         positions: [...new Set(positions)],
         posMask,
-        ppg: finiteNumber(source.ppg),
-        rpg: finiteNumber(source.rpg),
-        apg: finiteNumber(source.apg),
+        ppg: finiteNumber(stats.ppg),
+        rpg: finiteNumber(stats.rpg),
+        apg: finiteNumber(stats.apg),
         spg,
         bpg,
         sig: (spg > 0 ? 1 : 0) | (bpg > 0 ? 2 : 0),
         nameId,
-        id: source.id || `${source.player}_${source.team}_${source.era}`,
-        key: `${source.player}|${source.team}|${source.era}`,
+        id: source.id || `${player}_${source.team}_${source.era}`,
+        key: `${player}|${source.team}|${source.era}`,
       });
     }
 
@@ -855,6 +939,7 @@
     calculateTeamResult,
     projectedWins,
     rawTeamScore,
+    bestRolloutSequenceRaw,
     roundOne,
     positionMask,
     reachableRosterStates,
@@ -872,25 +957,79 @@
   if (typeof window === "undefined" || typeof document === "undefined") return;
   if (!/(^|\.)82-0\.com$/i.test(location.hostname)) return;
 
+  let observedDatasetUrl = null;
+  const datasetUrlWaiters = new Set();
+  const studioDatasetUrl = (value) => {
+    try {
+      const url = new URL(
+        typeof value === "string" ? value : value?.url || "",
+        location.href,
+      );
+      return url.hostname === "storage.googleapis.com" &&
+        /\/com\.vaultystudios\.eightytwoand0\/(?:nba\/)?players\/[^/]+\.json$/i.test(
+          url.pathname,
+        )
+        ? url.href
+        : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
   const nativeFetch = window.fetch.bind(window);
   window.fetch = (...args) => {
+    const datasetUrl = studioDatasetUrl(args[0]);
+    if (datasetUrl) {
+      observedDatasetUrl = datasetUrl;
+      for (const resolve of datasetUrlWaiters) resolve(datasetUrl);
+      datasetUrlWaiters.clear();
+    }
     const request = nativeFetch(...args);
     request
       .then((response) => {
-        if (
-          !response.ok ||
-          !response.url.includes("/game-session/api/v1/session/start")
-        )
-          return;
+        if (!response.ok) return;
+        const isSeededStart =
+          /\/game-session\/api\/v(?:1|2)\/session\/start(?:$|[?#])/i.test(
+            response.url,
+          );
+        const isDealtStart =
+          /\/game-session\/api\/v3\/session\/start(?:$|[?#])/i.test(
+            response.url,
+          );
+        const isDealtSpin =
+          /\/game-session\/api\/v3\/session\/spin(?:$|[?#])/i.test(
+            response.url,
+          );
+        if (!isSeededStart && !isDealtStart && !isDealtSpin) return;
         response
           .clone()
           .json()
-          .then((payload) => captureStudioSession(payload))
+          .then((payload) => {
+            if (isDealtSpin) captureDealtSpin(payload);
+            else if (isDealtStart) captureDealtSession(payload);
+            else captureStudioSession(payload, observedDatasetUrl);
+          })
           .catch(() => {});
       })
       .catch(() => {});
     return request;
   };
+
+  function waitForStudioDatasetUrl(timeoutMs = DATASET_WAIT_MS) {
+    if (observedDatasetUrl) return Promise.resolve(observedDatasetUrl);
+    return new Promise((resolve, reject) => {
+      const finish = (datasetUrl) => {
+        window.clearTimeout(timer);
+        datasetUrlWaiters.delete(finish);
+        resolve(datasetUrl);
+      };
+      const timer = window.setTimeout(() => {
+        datasetUrlWaiters.delete(finish);
+        reject(new Error("timed out waiting for the site's player dataset"));
+      }, timeoutMs);
+      datasetUrlWaiters.add(finish);
+    });
+  }
 
   const runtime = {
     dataReady: false,
@@ -919,6 +1058,8 @@
     pickOrder: 0,
     emptyTraySince: 0,
     sessionPayload: null,
+    dealtSessionId: null,
+    dealtCell: null,
     shadowSession: null,
     shadowReady: false,
     shadowSynced: false,
@@ -929,6 +1070,7 @@
     safetyOverride: null,
     scanTimer: 0,
     scanSerial: 0,
+    idleRecoveryScans: 0,
     resultMismatchCandidate: null,
     modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
     mode: safeSessionGet(MODE_KEY) || "classic",
@@ -1041,18 +1183,29 @@
         box-shadow: 0 0 18px rgba(56,189,248,.72) !important;
       }
       [data-82coach-retry="team"] {
-        outline: 3px solid ${COLORS.team} !important;
-        outline-offset: 2px !important;
-        box-shadow: 0 0 18px rgba(245,158,11,.75) !important;
+        position: relative !important;
+        z-index: 25 !important;
+        box-sizing: border-box !important;
+        border: 4px solid #fff7d6 !important;
+        border-radius: 999px !important;
+        outline: 5px solid #f59e0b !important;
+        outline-offset: 3px !important;
+        box-shadow: inset 0 0 0 3px #f59e0b, 0 0 0 9px rgba(245,158,11,.3), 0 0 34px 12px rgba(245,158,11,.9) !important;
         animation: __82coachPulse 1.1s ease-in-out infinite alternate;
       }
       [data-82coach-retry="era"] {
-        outline: 3px solid ${COLORS.era} !important;
-        outline-offset: 2px !important;
-        box-shadow: 0 0 18px rgba(168,85,247,.75) !important;
+        position: relative !important;
+        z-index: 25 !important;
+        box-sizing: border-box !important;
+        border: 4px solid #f5e8ff !important;
+        border-radius: 999px !important;
+        outline: 5px solid #a855f7 !important;
+        outline-offset: 3px !important;
+        box-shadow: inset 0 0 0 3px #a855f7, 0 0 0 9px rgba(168,85,247,.32), 0 0 34px 12px rgba(168,85,247,.9) !important;
         animation: __82coachPulse 1.1s ease-in-out infinite alternate;
       }
-      @keyframes __82coachPulse { from { filter:brightness(1); } to { filter:brightness(1.32); } }
+      [data-82coach-retry-muted="true"] { opacity:.34 !important; filter:grayscale(.8) brightness(.65) !important; }
+      @keyframes __82coachPulse { from { filter:brightness(1.08); } to { filter:brightness(1.48); } }
     `;
     document.head.appendChild(style);
   }
@@ -1247,11 +1400,54 @@
     );
   }
 
-  async function captureStudioSession(payload) {
+  function captureDealtSession(payload) {
+    if (!payload?.session_id || !Array.isArray(payload.slots)) return;
+    const sessionId = String(payload.session_id);
+    if (runtime.dealtSessionId !== sessionId) resetRuntime(runtime.mode);
+    runtime.dealtSessionId = sessionId;
+    runtime.dealtCell = null;
+    runtime.sessionPayload = null;
+    runtime.shadowSession = null;
+    runtime.shadowReady = false;
+    runtime.shadowSynced = false;
+    runtime.shadowPendingCell = null;
+    runtime.shadowPendingFrom = null;
+    runtime.shadowError =
+      "The site now deals future rolls on the server; future cells are hidden until they are played.";
+    runtime.lastAnalysisKey = "";
+    runtime.lastAnalysis = null;
+    if (document.body) scheduleScan(0);
+  }
+
+  function captureDealtSpin(payload) {
+    const cell = payload?.cell;
+    if (
+      !cell ||
+      !Number.isFinite(Number(cell.seq)) ||
+      !cell.team ||
+      !ERAS.has(cell.era) ||
+      !Array.isArray(cell.squad)
+    )
+      return;
+    runtime.dealtCell = {
+      seq: Number(cell.seq),
+      team: String(cell.team),
+      era: String(cell.era),
+      legal: Array.isArray(cell.legal) ? [...cell.legal] : [],
+      boosters: cell.boosters || null,
+    };
+    runtime.lastAnalysisKey = "";
+    runtime.lastAnalysis = null;
+    runtime.analysisInProgressKey = "";
+    if (document.body) scheduleScan(0);
+  }
+
+  async function captureStudioSession(payload, capturedDatasetUrl = null) {
+    const datasetUrl = payload?.dataset_url || capturedDatasetUrl;
     if (
       !payload?.session_id ||
       !Number.isFinite(Number(payload.seed)) ||
-      !payload.dataset_url ||
+      !datasetUrl ||
       !Array.isArray(payload.slots) ||
       payload.slots.length !== 5 ||
       !payload.slots.every(
@@ -1274,7 +1470,7 @@
       session_id: capturedSessionId,
       seed: Number(payload.seed) >>> 0,
       dataset_version: String(payload.dataset_version || ""),
-      dataset_url: String(payload.dataset_url),
+      dataset_url: String(datasetUrl),
       slots: payload.slots.map((slot) => ({
         id: String(slot.id),
         positions: [...(slot.positions || [])],
@@ -1370,18 +1566,18 @@
   function commitShadowPick(row, requestedPosition) {
     const shadow = runtime.shadowSession;
     if (!runtime.shadowReady || !runtime.shadowSynced || !shadow?.current)
-      return;
+      return false;
     const playerId = shadow.resolvePlayerId(row);
     if (!playerId) {
       runtime.shadowSynced = false;
       runtime.shadowError = `could not resolve ${row.player}`;
-      return;
+      return false;
     }
     const from = { team: shadow.current.team, era: shadow.current.era };
     if (!shadow.recordPick(requestedPosition, playerId)) {
       runtime.shadowSynced = false;
       runtime.shadowError = `could not record ${row.player}`;
-      return;
+      return false;
     }
     if (shadow.openSlots.length) {
       const predicted = shadow.nextSpin();
@@ -1390,6 +1586,7 @@
         ? { team: predicted.team, era: predicted.era }
         : null;
     }
+    return true;
   }
 
   function commitShadowRetry(scope) {
@@ -1464,26 +1661,11 @@
   }
 
   async function loadRows() {
-    let data = null;
-    try {
-      const cached = JSON.parse(localStorage.getItem(DATA_CACHE_KEY) || "null");
-      if (
-        cached?.version === "v2" &&
-        Array.isArray(cached.data) &&
-        Date.now() - finiteNumber(cached.timestamp) < 7 * 24 * 60 * 60 * 1000
-      ) {
-        data = cached.data;
-      }
-    } catch (_) {
-      data = null;
-    }
-
-    if (!data) {
-      const response = await fetch(DATA_URL, { credentials: "same-origin" });
-      if (!response.ok)
-        throw new Error(`player data returned ${response.status}`);
-      data = await response.json();
-    }
+    const datasetUrl = await waitForStudioDatasetUrl();
+    const response = await nativeFetch(datasetUrl);
+    if (!response.ok)
+      throw new Error(`player dataset returned ${response.status}`);
+    const data = await response.json();
 
     const normalized = normalizeDataset(data);
     const coveredPositions = normalized.rows.reduce(
@@ -1524,6 +1706,8 @@
   }
 
   function getPlayerListRoot() {
+    const currentCard = document.querySelector('[data-testid="player-card"]');
+    if (currentCard) return currentCard.parentElement || currentCard;
     const inputs = [...document.querySelectorAll("input")];
     const search = inputs.find((input) =>
       /search/i.test(input.getAttribute("placeholder") || ""),
@@ -1536,20 +1720,30 @@
       );
     }
     // Localized copies may not use the English "Search..." placeholder.
-    const fallbackCard = [...document.querySelectorAll("div[draggable]")].find(
-      (element) => Boolean(rowFromCard(element)),
-    );
+    const fallbackCard = [
+      ...document.querySelectorAll(
+        '[data-testid="player-card"],div[draggable]',
+      ),
+    ].find((element) => Boolean(rowFromCard(element)));
     return fallbackCard?.parentElement || null;
   }
 
   function rowFromCard(card) {
     if (!card) return null;
+    const datasetName = card.getAttribute("data-player")?.trim();
     const paragraphs = [...card.querySelectorAll("p")];
-    const nameElement = paragraphs.find((paragraph) =>
-      runtime.namesSet.has(paragraph.textContent.trim()),
-    );
-    if (!nameElement) return null;
-    const name = nameElement.textContent.trim();
+    const name =
+      (datasetName && runtime.namesSet.has(datasetName) && datasetName) ||
+      paragraphs
+        .map((paragraph) => paragraph.textContent.trim())
+        .find((text) => runtime.namesSet.has(text));
+    if (!name) return null;
+    if (runtime.dealtCell) {
+      const dealtRow = runtime.byKey.get(
+        `${name}|${runtime.dealtCell.team}|${runtime.dealtCell.era}`,
+      );
+      if (dealtRow) return dealtRow;
+    }
     const cellText = paragraphs
       .map((paragraph) => paragraph.textContent.trim())
       .find((text) => /\b[A-Z0-9]{2,4}\s*·\s*(?:19|20)\d0s\b/.test(text));
@@ -1560,34 +1754,45 @@
   }
 
   function findCards() {
-    const root = getPlayerListRoot();
-    if (!root) return [];
     const cards = [];
-    for (const candidate of root.querySelectorAll("div[draggable]")) {
+    for (const candidate of document.querySelectorAll(
+      '[data-testid="player-card"],div[draggable]',
+    )) {
       const row = rowFromCard(candidate);
       if (!row) continue;
       cards.push({
         element: candidate,
         row,
-        enabled: candidate.getAttribute("draggable") === "true",
+        enabled:
+          candidate.getAttribute("data-selectable") !== "false" &&
+          candidate.getAttribute("draggable") !== "false",
       });
     }
     return cards;
   }
 
   function parseCell(cards) {
+    if (runtime.dealtCell && cards.length)
+      return { team: runtime.dealtCell.team, era: runtime.dealtCell.era };
     if (cards.length) return { team: cards[0].row.team, era: cards[0].row.era };
     return runtime.lastCell;
   }
 
   function parseTray() {
     const tray = document.querySelector("[data-lineup-tray]");
-    if (!tray) return { present: false, slots: new Map() };
+    const controls = new Set();
+    if (tray) {
+      for (const slot of tray.querySelectorAll('[role="button"]'))
+        controls.add(slot);
+    }
+    for (const slot of document.querySelectorAll(
+      'button[data-track-name="draft_slot_place"],[data-court-slot]',
+    ))
+      controls.add(slot);
+    if (!controls.size) return { present: false, slots: new Map() };
     const slots = new Map();
-    for (const slot of tray.querySelectorAll('[role="button"]')) {
-      const position = [...slot.querySelectorAll("span")]
-        .map((element) => element.textContent.trim())
-        .find((text) => POSITION_INDEX[text] !== undefined);
+    for (const slot of controls) {
+      const position = controlPosition(slot);
       if (!position) continue;
       let name = [...slot.querySelectorAll("p")]
         .map((element) => element.textContent.trim())
@@ -1607,7 +1812,7 @@
     return { present: true, slots };
   }
 
-  function commitPendingPickIfNeeded(trayState) {
+  function commitPendingPickIfNeeded(trayState, cell) {
     const pending = runtime.pendingPick;
     if (!pending) return;
     const found = [...trayState.slots.entries()].find(
@@ -1619,7 +1824,12 @@
       runtime.tracked.size === 4 &&
       !getPlayerListRoot() &&
       Date.now() - pending.time > 60;
-    if (found || onResults || finalTransition) {
+    // On the current site, the next seeded cell can render before the lineup
+    // tray exposes the pick that caused it. Treat that cell advance as the
+    // placement confirmation so the shadow session advances before syncing.
+    const cellAdvanced =
+      cell && runtime.lastCell && !sameCell(cell, runtime.lastCell);
+    if (found || onResults || finalTransition || cellAdvanced) {
       const position = found?.[0] || pending.position;
       runtime.tracked.set(pending.row.player, {
         row: pending.row,
@@ -1627,40 +1837,35 @@
         originalPosition: pending.position,
         order: ++runtime.pickOrder,
       });
-      commitShadowPick(pending.row, pending.position);
+      if (!pending.shadowCommitted)
+        pending.shadowCommitted = commitShadowPick(
+          pending.row,
+          pending.position,
+        );
       runtime.pendingPick = null;
       runtime.selectedRow = null;
       persistTrackedPicks();
-    } else if (Date.now() - pending.time > 1600) {
+    } else if (Date.now() - pending.time > PENDING_PICK_MAX_AGE) {
       runtime.pendingPick = null;
     }
   }
 
-  function reconcileRoster() {
+  function reconcileRoster(cell) {
     const trayState = parseTray();
-    commitPendingPickIfNeeded(trayState);
+    commitPendingPickIfNeeded(trayState, cell);
     if (!trayState.present) return trayState;
 
     if (trayState.slots.size === 0 && runtime.tracked.size) {
-      if (!runtime.emptyTraySince) {
-        runtime.emptyTraySince = Date.now();
-        scheduleScan(850);
-        return trayState;
-      }
-      if (Date.now() - runtime.emptyTraySince < 750) return trayState;
-      runtime.tracked.clear();
-      runtime.lastOffers.clear();
-      runtime.recentOffers.clear();
-      runtime.pendingPick = null;
-      runtime.selectedRow = null;
-      runtime.optimizer?.clearCache();
-      runtime.persistedPicks.clear();
-      runtime.pickOrder = 0;
-      safeSessionRemove(PICKS_KEY);
-      runtime.emptyTraySince = 0;
+      // The redesigned desktop picker temporarily replaces the filled lineup
+      // with five empty placement controls while a card is selected. Session
+      // start/reset events are authoritative, so never erase the roster from
+      // that transient empty view.
+      runtime.emptyTraySince = Date.now();
+      scheduleScan(850);
       return trayState;
     }
     runtime.emptyTraySince = 0;
+    runtime.idleRecoveryScans = 0;
 
     let changed = false;
     const visibleNames = new Set(trayState.slots.values());
@@ -1707,9 +1912,17 @@
 
   function currentEntries(trayState) {
     const entries = [];
+    const included = new Set();
     for (const [position, name] of trayState.slots) {
       const tracked = runtime.tracked.get(name);
-      if (tracked?.row) entries.push({ row: tracked.row, position });
+      if (tracked?.row) {
+        entries.push({ row: tracked.row, position });
+        included.add(name);
+      }
+    }
+    for (const [name, tracked] of runtime.tracked) {
+      if (!included.has(name) && tracked?.row)
+        entries.push({ row: tracked.row, position: tracked.position });
     }
     return entries;
   }
@@ -1796,6 +2009,104 @@
       if (compareActions(action, best) > 0) best = action;
     }
     return { cell, best, actions };
+  }
+
+  function hashText(value) {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
+  }
+
+  function sampledFuturePools(rounds, sampleCount, seedText) {
+    if (rounds <= 0) return [[]];
+    const keys = [...runtime.byCell.keys()].sort();
+    if (!keys.length) return [];
+    const rng = new MulberryRng(hashText(seedText));
+    return Array.from({ length: sampleCount }, () =>
+      Array.from({ length: rounds }, () => {
+        const key = keys[Math.floor(rng.next() * keys.length)];
+        return runtime.byCell.get(key) || [];
+      }),
+    );
+  }
+
+  function compareForecastActions(left, right) {
+    if (!right) return 1;
+    const leftForecast = left.forecastRaw ?? left.ceiling.raw;
+    const rightForecast = right.forecastRaw ?? right.ceiling.raw;
+    if (Math.abs(leftForecast - rightForecast) > EPSILON)
+      return leftForecast > rightForecast ? 1 : -1;
+    return compareActions(left, right);
+  }
+
+  function forecastEvaluation(
+    evaluation,
+    entries,
+    { samples, maxActions, seed },
+  ) {
+    if (!evaluation?.actions?.length) return evaluation;
+    const fixedRows = entries.map((entry) => entry.row);
+    const remainingRounds = Math.max(0, 5 - fixedRows.length - 1);
+    const perRanking = Math.max(1, Math.ceil(maxActions / 2));
+    const shortlist = new Map();
+    for (const action of [...evaluation.actions]
+      .sort((left, right) => right.ceiling.raw - left.ceiling.raw)
+      .slice(0, perRanking))
+      shortlist.set(`${action.row.key}@${action.position}`, action);
+    for (const action of [...evaluation.actions]
+      .sort(
+        (left, right) =>
+          (right.immediate?.raw || 0) - (left.immediate?.raw || 0),
+      )
+      .slice(0, perRanking))
+      shortlist.set(`${action.row.key}@${action.position}`, action);
+    if (evaluation.best)
+      shortlist.set(
+        `${evaluation.best.row.key}@${evaluation.best.position}`,
+        evaluation.best,
+      );
+
+    const sequences = sampledFuturePools(
+      remainingRounds,
+      samples,
+      `${seed}|${fixedRows.map((row) => row.key).sort().join(";")}`,
+    );
+    for (const action of shortlist.values()) {
+      const pickedRows = [...fixedRows, action.row];
+      const outcomes = [];
+      for (const sequence of sequences) {
+        const raw = bestRolloutSequenceRaw(
+          pickedRows,
+          action.ceiling.occupiedMask,
+          sequence,
+        );
+        if (raw !== null) outcomes.push(raw);
+      }
+      if (!outcomes.length) continue;
+      outcomes.sort((left, right) => left - right);
+      action.forecastRaw =
+        outcomes.reduce((sum, raw) => sum + raw, 0) / outcomes.length;
+      action.forecastScore = roundOne(action.forecastRaw);
+      action.forecastWins =
+        outcomes.reduce(
+          (sum, raw) => sum + projectedWins(roundOne(raw)),
+          0,
+        ) / outcomes.length;
+      action.forecastPathRate =
+        outcomes.filter((raw) => projectedWins(roundOne(raw)) === 82).length /
+        outcomes.length;
+      action.forecastLow = roundOne(
+        outcomes[Math.floor((outcomes.length - 1) * 0.25)],
+      );
+    }
+    evaluation.best = [...shortlist.values()].reduce((winner, action) =>
+      compareForecastActions(action, winner) > 0 ? action : winner,
+    null);
+    evaluation.forecastSamples = sequences.length;
+    return evaluation;
   }
 
   function studioOpenMask() {
@@ -2219,23 +2530,38 @@
     const outcomes = [];
     let legalCount = 0;
     let totalRaw = 0;
+    let totalWins = 0;
     let pathCount = 0;
+    let ceilingPathCount = 0;
     for (const alternative of cells) {
-      const result = evaluateCell(alternative, entries, false);
+      const result = forecastEvaluation(
+        evaluateCell(alternative, entries, false),
+        entries,
+        {
+          samples: ROLLOUT_RETRY_SAMPLES,
+          maxActions: ROLLOUT_RETRY_ACTIONS,
+          seed: `retry:${scope}:${cell.team}|${cell.era}:${alternative.team}|${alternative.era}`,
+        },
+      );
       if (!result.best) {
         outcomes.push({ cell: alternative, action: null });
         continue;
       }
       legalCount += 1;
-      totalRaw += result.best.ceiling.raw;
-      if (result.best.ceiling.possible82) pathCount += 1;
+      if (result.actions.some((action) => action.ceiling.possible82))
+        ceilingPathCount += 1;
+      totalRaw += result.best.forecastRaw ?? result.best.ceiling.raw;
+      totalWins += result.best.forecastWins ?? result.best.ceiling.wins;
+      pathCount +=
+        result.best.forecastPathRate ??
+        Number(result.best.ceiling.possible82);
       outcomes.push({ cell: alternative, action: result.best });
     }
     if (!cells.length) return null;
     const meanRaw = totalRaw / cells.length;
     const best = outcomes.reduce((winner, outcome) => {
       const action = outcome.action;
-      return action && (!winner || compareActions(action, winner) > 0)
+      return action && (!winner || compareForecastActions(action, winner) > 0)
         ? action
         : winner;
     }, null);
@@ -2247,7 +2573,9 @@
       legalRate: legalCount / cells.length,
       meanRaw,
       meanScore: roundOne(meanRaw),
+      meanWins: totalWins / cells.length,
       pathRate: pathCount / cells.length,
+      ceilingPathRate: ceilingPathCount / cells.length,
       best,
     };
   }
@@ -2262,6 +2590,7 @@
   function findRetryButtons() {
     const buttons = [...document.querySelectorAll("button")];
     const team =
+      document.querySelector('button[data-track-name="draft_skip_team"]') ||
       buttons.find(
         (button) =>
           normalizedButtonText(button) === "team" &&
@@ -2275,6 +2604,7 @@
           normalizedButtonText(button) === "team" && isVisible(button),
       );
     const era =
+      document.querySelector('button[data-track-name="draft_skip_era"]') ||
       buttons.find(
         (button) =>
           normalizedButtonText(button) === "era" &&
@@ -2305,7 +2635,6 @@
   ) {
     const retryLegal = (retry) =>
       retry?.reachableLegal ?? retry?.legalCount > 0;
-    const retryPath = (retry) => retry?.reachablePath ?? retry?.pathRate > 0;
     const retryValue = (retry) => retry?.decisionRaw ?? retry?.meanRaw ?? 0;
     const availableRetries = [
       retries.team.available && teamRetry ? teamRetry : null,
@@ -2321,25 +2650,6 @@
       }
       return winner;
     }, null);
-    const bestPathRetry = availableRetries
-      .filter(retryPath)
-      .reduce((winner, retry) => {
-        if (!winner) return retry;
-        const retryPathStrength = retry.exact
-          ? Number(retryPath(retry))
-          : retry.pathRate;
-        const winnerPathStrength = winner.exact
-          ? Number(retryPath(winner))
-          : winner.pathRate;
-        if (Math.abs(retryPathStrength - winnerPathStrength) > EPSILON) {
-          return retryPathStrength > winnerPathStrength ? retry : winner;
-        }
-        if (Math.abs(retryValue(retry) - retryValue(winner)) > EPSILON) {
-          return retryValue(retry) > retryValue(winner) ? retry : winner;
-        }
-        return winner;
-      }, null);
-
     if (!current.best) {
       if (bestRetry)
         return {
@@ -2350,48 +2660,38 @@
     }
 
     if (!bestRetry)
-      return { kind: "pick", reason: "This is the best legal ceiling." };
+      return { kind: "pick", reason: "This has the strongest expected finish." };
     const slotsAfterPick = Math.max(0, openSlots - 1);
-    const saveMargin = slotsAfterPick === 0 ? 0 : 0.45 + 0.2 * slotsAfterPick;
-    const currentKeepsPath = current.best.ceiling.possible82;
-    const priorPossible = priorCeiling?.possible82;
-
-    if (priorPossible && !currentKeepsPath && bestPathRetry) {
-      return {
-        kind: bestPathRetry.scope,
-        reason: bestPathRetry.chainRecommended
-          ? `Every pick here loses 82-0. Use ${bestPathRetry.scope.toUpperCase()} retry, then ${bestPathRetry.chain.scope.toUpperCase()} retry.`
-          : "Every pick in this pool loses the 82-0 ceiling; retrying can preserve it.",
-      };
-    }
-
-    const expectedGain = retryValue(bestRetry) - current.best.ceiling.raw;
+    const saveMargin = slotsAfterPick === 0 ? 0 : 0.65 + 0.2 * slotsAfterPick;
+    const currentValue = current.best.forecastRaw ?? current.best.ceiling.raw;
+    const expectedGain = retryValue(bestRetry) - currentValue;
     if (expectedGain > saveMargin + EPSILON) {
       return {
         kind: bestRetry.scope,
         reason: bestRetry.chainRecommended
           ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; that branch adds about ${expectedGain.toFixed(1)} ceiling points.`
-          : `The retry improves the ideal-future ceiling by about ${expectedGain.toFixed(1)} points.`,
+          : `The retry improves the expected final score by about ${expectedGain.toFixed(1)} points.`,
       };
     }
     return {
       kind: "pick",
       reason:
         expectedGain > 0
-          ? "The small retry gain is not worth spending the retry this early."
-          : "Picking now has the stronger ceiling; save both retries.",
+          ? "The small expected gain is not worth spending the retry this early."
+          : "Picking now has the stronger expected finish; save both retries.",
     };
   }
 
   function clearHighlights() {
     for (const element of document.querySelectorAll(
-      "[data-82coach-card],[data-82coach-locked],[data-82coach-position],[data-82coach-retry]",
+      "[data-82coach-card],[data-82coach-locked],[data-82coach-position],[data-82coach-retry],[data-82coach-retry-muted]",
     )) {
       element.removeAttribute("data-82coach-card");
       element.removeAttribute("data-82coach-label");
       element.removeAttribute("data-82coach-locked");
       element.removeAttribute("data-82coach-position");
       element.removeAttribute("data-82coach-retry");
+      element.removeAttribute("data-82coach-retry-muted");
       element.style.removeProperty("--82coach-color");
     }
   }
@@ -2399,6 +2699,9 @@
   function controlPosition(element) {
     const texts = [
       element.getAttribute?.("aria-label") || "",
+      element.getAttribute?.("data-position") || "",
+      element.getAttribute?.("data-court-slot") || "",
+      element.getAttribute?.("data-tray-slot") || "",
       ...[...(element.querySelectorAll?.("span") || [])].map((span) =>
         span.textContent.trim(),
       ),
@@ -2415,6 +2718,9 @@
   }
 
   function controlHasPlayer(element) {
+    const label = element.getAttribute?.("aria-label") || "";
+    const position = controlPosition(element);
+    if (position && new RegExp(`^${position}\\s*:`).test(label)) return true;
     return [...element.querySelectorAll("p")].some((paragraph) =>
       runtime.namesSet.has(paragraph.textContent.trim()),
     );
@@ -2464,6 +2770,17 @@
         }
       }
     }
+    for (const control of document.querySelectorAll(
+      'button[data-track-name="draft_slot_place"],[data-court-slot]',
+    )) {
+      if (
+        isVisible(control) &&
+        controlPosition(control) === position &&
+        (!openOnly || !controlHasPlayer(control))
+      ) {
+        targets.add(control);
+      }
+    }
     return [...targets];
   }
 
@@ -2479,6 +2796,11 @@
       retries[advice.kind]?.element?.setAttribute(
         "data-82coach-retry",
         advice.kind,
+      );
+      const otherKind = advice.kind === "team" ? "era" : "team";
+      retries[otherKind]?.element?.setAttribute(
+        "data-82coach-retry-muted",
+        "true",
       );
     }
 
@@ -2552,9 +2874,11 @@
     const isRetry = advice.kind === "team" || advice.kind === "era";
     const move = advice.kind === "pick" ? best?.moves?.[0] : null;
     const retriesAvailable = retries.team.available || retries.era.available;
-    const retryCanRestorePath = Boolean(
-      (advice.teamRetry?.reachablePath ?? advice.teamRetry?.pathRate > 0) ||
-        (advice.eraRetry?.reachablePath ?? advice.eraRetry?.pathRate > 0),
+    const retryCanRestoreCeiling = Boolean(
+      (advice.teamRetry?.reachablePath ??
+        advice.teamRetry?.ceilingPathRate > 0) ||
+        (advice.eraRetry?.reachablePath ??
+          advice.eraRetry?.ceilingPathRate > 0),
     );
     const availableRetrySummaries = [
       retries.team.available ? advice.teamRetry : null,
@@ -2565,31 +2889,50 @@
         availableRetrySummaries.length ===
           Number(retries.team.available) + Number(retries.era.available) &&
         availableRetrySummaries.every((retry) => retry.exact) &&
-        !retryCanRestorePath,
+        !retryCanRestoreCeiling,
     );
     const impossible =
       !runtime.modelMismatch &&
       (seededResult
         ? !seededResult.possible82
         : advice.priorCeiling && !advice.priorCeiling.possible82);
+    const currentCanKeepCeiling = current.actions.some(
+      (action) => action.ceiling.possible82,
+    );
     const forcedImpossible =
       !runtime.modelMismatch &&
       !seededResult &&
       !impossible &&
-      !best?.ceiling.possible82 &&
-      (!retriesAvailable || exactRetryTreeExhausted);
+      !currentCanKeepCeiling &&
+      (!retriesAvailable ||
+        exactRetryTreeExhausted ||
+        !retryCanRestoreCeiling);
+    const chosenRetry =
+      advice.kind === "team"
+        ? advice.teamRetry
+        : advice.kind === "era"
+          ? advice.eraRetry
+          : null;
+    const recommendedKeepsCeiling = isRetry
+      ? chosenRetry?.reachablePath ?? chosenRetry?.ceilingPathRate > 0
+      : best?.ceiling.possible82;
     const atRisk =
       !runtime.modelMismatch &&
       !seededResult &&
       !impossible &&
       !forcedImpossible &&
-      !best?.ceiling.possible82 &&
-      retriesAvailable;
+      !recommendedKeepsCeiling;
+    const sampledPathRate = seededResult
+      ? Number(seededResult.possible82)
+      : isRetry
+        ? chosenRetry?.pathRate || 0
+        : best?.forecastPathRate || 0;
+    const sampledPathPercent = Math.round(sampledPathRate * 100);
     const statusColor = runtime.modelMismatch
       ? COLORS.team
       : impossible || forcedImpossible
         ? COLORS.impossible
-        : atRisk
+        : atRisk || sampledPathPercent < 25
           ? COLORS.team
           : COLORS.pick;
     const statusText = runtime.modelMismatch
@@ -2601,19 +2944,19 @@
         : forcedImpossible
           ? `82-0 now impossible · best reachable max ${roundOne(
               Math.max(
-                best?.ceiling.raw || 0,
+                ...current.actions.map((action) => action.ceiling.raw),
                 ...availableRetrySummaries.map(
-                  (retry) => retry.decisionRaw || retry.meanRaw || 0,
+                  (retry) => retry.best?.ceiling.raw || 0,
                 ),
               ),
             ).toFixed(1)}`
           : atRisk
-            ? retryCanRestorePath
-              ? "82-0 at risk · a retry is required"
-              : "82-0 at risk · no one-retry path found"
+            ? "82-0 remains mathematically possible · recommendation favors the higher average"
             : seededResult
               ? `82-0 achievable · exact seeded max ${seededResult.score.toFixed(1)}`
-              : `82-0 still possible · max ${advice.priorCeiling.score.toFixed(1)}`;
+              : sampledPathPercent
+                ? `82-0 mathematically possible · ${sampledPathPercent}% of sampled futures`
+                : "82-0 mathematically possible · not reached in sampled futures";
     const actionColor = isRetry
       ? COLORS[advice.kind]
       : move
@@ -2646,6 +2989,9 @@
       (isRetry || move) && runtime.safetyOverride !== advice.cellSignature;
     const pickedResult = calculateTeamResult(entries.map((entry) => entry.row));
     const currentLine = best ? scoreText(best.ceiling) : "—";
+    const expectedLine = Number.isFinite(best?.forecastScore)
+      ? `${best.forecastScore.toFixed(1)} avg · ${best.forecastWins.toFixed(0)} wins avg`
+      : currentLine;
 
     const stats = best
       ? `${best.row.ppg.toFixed(1)} PTS · ${best.row.rpg.toFixed(1)} REB · ${best.row.apg.toFixed(1)} AST · ${best.row.spg.toFixed(1)} STL · ${best.row.bpg.toFixed(1)} BLK`
@@ -2674,23 +3020,17 @@
         const chained = retry.chain;
         return `${direct}; then ${chained.scope.toUpperCase()} → ${chained.cell.team} ${chained.cell.era} · ${chained.action.ceiling.score.toFixed(1)}`;
       }
-      return `${retry.meanScore.toFixed(1)} avg · ${Math.round(retry.pathRate * 100)}% keep path · ${Math.round(retry.legalRate * 100)}% legal`;
+      return `${retry.meanScore.toFixed(1)} avg · ${retry.meanWins.toFixed(0)} wins avg · ${Math.round(retry.pathRate * 100)}% sampled 82`;
     };
     const teamForecast = formatRetry(advice.teamRetry, retries.team.available);
     const eraForecast = formatRetry(advice.eraRetry, retries.era.available);
-    const chosenRetry =
-      advice.kind === "team"
-        ? advice.teamRetry
-        : advice.kind === "era"
-          ? advice.eraRetry
-          : null;
     const actionMetric = chosenRetry
       ? seededResult
         ? scoreText(seededResult)
         : chosenRetry.exact
           ? `${(chosenRetry.chainRecommended ? chosenRetry.decisionScore : chosenRetry.meanScore).toFixed(1)} · ${(chosenRetry.reachablePath ?? chosenRetry.pathRate) ? "82 path" : "no 82 path"}`
-          : `${chosenRetry.meanScore.toFixed(1)} avg · ${Math.round(chosenRetry.pathRate * 100)}% path`
-      : currentLine;
+          : `${chosenRetry.meanScore.toFixed(1)} avg · ${chosenRetry.meanWins.toFixed(0)} wins avg`
+      : expectedLine;
 
     const seededRoute = advice.seededPlan?.steps?.length
       ? `<div class="route">
@@ -2713,12 +3053,13 @@
     const details = ui.details
       ? `<div class="details">
           <div class="row"><span>Picked team now</span><strong>${entries.length}/5 · ${scoreText(pickedResult)}</strong></div>
+          <div class="row"><span>Expected final</span><strong>${escapeHtml(expectedLine)}</strong></div>
           <div class="row"><span>Best current-pool ceiling</span><strong>${escapeHtml(currentLine)}</strong></div>
           ${seededResult ? `<div class="row"><span>Exact seeded final maximum</span><strong>${escapeHtml(scoreText(seededResult))}</strong></div>` : ""}
           <div class="row"><span>Team retry forecast</span><strong>${escapeHtml(teamForecast)}</strong></div>
           <div class="row"><span>Era retry forecast</span><strong>${escapeHtml(eraForecast)}</strong></div>
           <div class="row"><span>Reason</span><strong>${escapeHtml(advice.reason)}</strong></div>
-          <div class="row"><span>Model</span><strong>${advice.seededPlan ? "Exact seeded full draft" : runtime.shadowReady && runtime.shadowSynced ? "Exact seeded retries" : "Conditional retry forecast"} · ${MODEL_VERIFIED}</strong></div>
+          <div class="row"><span>Model</span><strong>${advice.seededPlan ? "Exact seeded full draft" : runtime.shadowReady && runtime.shadowSynced ? "Exact seeded retries" : "Expected-value server rollouts"} · ${MODEL_VERIFIED}</strong></div>
           ${seededRoute}
           <div class="legend">
             <span class="swatch" style="--c:${COLORS.pick}">pick</span>
@@ -2746,7 +3087,7 @@
         <div class="eyebrow">${eyebrow}</div>
         <div class="primary"><span class="name">${escapeHtml(primary)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
         <div class="sub">${escapeHtml(subline)}</div>
-        <div class="metrics"><span>${seededResult ? "Exact seeded final" : isRetry ? "Retry forecast" : "Ideal-future ceiling"}</span><strong>${escapeHtml(actionMetric)}</strong><span>${advice.kind === "pick" && !move ? "Open after pick" : "Open positions"}</span><strong>${escapeHtml(remainingAfterAction.join(" · ") || "Complete")}</strong></div>
+        <div class="metrics"><span>${seededResult ? "Exact seeded final" : isRetry ? "Retry expected final" : "Expected final"}</span><strong>${escapeHtml(actionMetric)}</strong><span>${advice.kind === "pick" && !move ? "Open after pick" : "Open positions"}</span><strong>${escapeHtml(remainingAfterAction.join(" · ") || "Complete")}</strong></div>
       </div>
       ${fallbackHtml}
       ${filterHint}
@@ -2835,9 +3176,16 @@
   }
 
   function detectModeFromPage() {
-    const queryMode = new URLSearchParams(location.search).get("play");
-    if (queryMode === "hoopiq") setMode("hoopiq");
-    if (queryMode === "classic") setMode("classic");
+    const query = new URLSearchParams(location.search);
+    const queryMode = query.get("mode") || query.get("play");
+    const opponent = query.get("opponent");
+    const stats = query.get("stats");
+    // The redesigned site represents 1v1 as Classic + a bot variant rather
+    // than mode=1v1. Check variants before the base mode so a later scan does
+    // not overwrite the click-captured 1v1 label.
+    if (opponent === "bot" || queryMode === "1v1") setMode("1v1");
+    else if (stats === "hidden" || queryMode === "hoopiq") setMode("hoopiq");
+    else if (queryMode === "classic") setMode("classic");
     const bodyText = document.body?.innerText || "";
     if (/\bHOOP\s*IQ\b/i.test(bodyText) && getPlayerListRoot())
       setMode("hoopiq");
@@ -2865,7 +3213,10 @@
     runtime.persistedPicks.clear();
     runtime.pickOrder = 0;
     runtime.emptyTraySince = 0;
+    runtime.idleRecoveryScans = 0;
     runtime.sessionPayload = null;
+    runtime.dealtSessionId = null;
+    runtime.dealtCell = null;
     runtime.shadowSession = null;
     runtime.shadowReady = false;
     runtime.shadowSynced = false;
@@ -2915,12 +3266,33 @@
       .replace(/\s+/g, " ")
       .trim()
       .toLowerCase();
-    if (text.includes("play 1v1")) resetRuntime("1v1");
-    else if (text.includes("play hoop") || text === "hoop iq")
+    const trackName = button?.getAttribute("data-track-name") || "";
+    if (text.includes("play 1v1") || trackName === "mode_play_1v1")
+      resetRuntime("1v1");
+    else if (
+      text.includes("play hoop") ||
+      text === "hoop iq" ||
+      trackName === "mode_play_hoopiq"
+    )
       resetRuntime("hoopiq");
-    else if (text.includes("play classic") || text === "classic")
+    else if (
+      text.includes("play classic") ||
+      text === "classic" ||
+      trackName === "mode_play_classic"
+    )
       resetRuntime("classic");
     else if (/^build another(?: team)?$/.test(text)) resetRuntime(runtime.mode);
+
+    // The new site can delay updating the lineup tray until the next roll.
+    // A visible SPIN button proves the placement succeeded, so advance the
+    // seeded shadow before the site renders the next cell.
+    if (text === "spin" && runtime.pendingPick?.row) {
+      if (!runtime.pendingPick.shadowCommitted)
+        runtime.pendingPick.shadowCommitted = commitShadowPick(
+          runtime.pendingPick.row,
+          runtime.pendingPick.position,
+        );
+    }
 
     const retryButtons = findRetryButtons();
     if (
@@ -2935,10 +3307,18 @@
       runtime.lastAnalysisKey = "";
       runtime.lastAnalysis = null;
       scheduleScan(80);
+      // The current site resolves the booster request and retry animation in
+      // separate React updates. Those changes are not always DOM mutations,
+      // so make a few bounded follow-up scans instead of getting stuck idle.
+      window.setTimeout(() => scheduleScan(0), 700);
+      window.setTimeout(() => scheduleScan(0), 2_200);
+      window.setTimeout(() => scheduleScan(0), 4_500);
       return;
     }
 
-    const cardElement = event.target.closest?.("div[draggable]");
+    const cardElement = event.target.closest?.(
+      '[data-testid="player-card"],div[draggable]',
+    );
     const cardRow = rowFromCard(cardElement);
     if (cardRow) runtime.selectedRow = cardRow;
 
@@ -2960,7 +3340,9 @@
 
   function handleDragStart(event) {
     if (interactionGuard(event)) return;
-    const row = rowFromCard(event.target.closest?.("div[draggable]"));
+    const row = rowFromCard(
+      event.target.closest?.('[data-testid="player-card"],div[draggable]'),
+    );
     if (row) runtime.selectedRow = row;
   }
 
@@ -3011,11 +3393,10 @@
       return;
     }
 
-    const trayState = reconcileRoster();
-    if (renderResultsIfPresent()) return;
-
     const cards = findCards();
     const cell = parseCell(cards);
+    const trayState = reconcileRoster(cell);
+    if (renderResultsIfPresent()) return;
     if (!cell || !getPlayerListRoot() || !trayState.present) {
       clearHighlights();
       const waiting = /spinning|respinning/i.test(
@@ -3027,8 +3408,17 @@
         `<div class="loading">${escapeHtml(waiting)}</div>`,
         `idle:${waiting}:${runtime.mode}`,
       );
+      if (
+        trayState.present &&
+        document.querySelector('[data-testid="player-card"],div[draggable]') &&
+        runtime.idleRecoveryScans < MAX_IDLE_RECOVERY_SCANS
+      ) {
+        runtime.idleRecoveryScans += 1;
+        scheduleScan(500);
+      }
       return;
     }
+    runtime.idleRecoveryScans = 0;
 
     if (
       runtime.lastCell &&
@@ -3049,7 +3439,7 @@
     if (runtime.recentOffers.size > 700) runtime.recentOffers.clear();
 
     const entries = currentEntries(trayState);
-    if (entries.length !== trayState.slots.size) {
+    if (entries.length < trayState.slots.size) {
       renderLoading("Syncing your previously selected peaks…");
       return;
     }
@@ -3084,7 +3474,14 @@
             if (runtime.analysisInProgressKey !== analysisKey) return;
             try {
               const completed = {
-                current: evaluateCell(cell, entries),
+                current: forecastEvaluation(evaluateCell(cell, entries), entries, {
+                  samples: ROLLOUT_CURRENT_SAMPLES,
+                  maxActions: ROLLOUT_CURRENT_ACTIONS,
+                  seed: `pick:${cell.team}|${cell.era}:${entries
+                    .map((entry) => entry.row.key)
+                    .sort()
+                    .join(";")}`,
+                }),
                 teamRetry: retries.team.available
                   ? summarizeRetry("team", cell, entries)
                   : null,
