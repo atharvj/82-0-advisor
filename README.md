@@ -12,6 +12,8 @@ The current site deals future rolls from its server and no longer exposes them i
 
 The coach is advisory only: it highlights recommendations without blocking any player, position, or retry button. Use the `⏻` button in its header to turn the coach off for as many games as you want; the small **Coach off** pill remains available to turn it back on.
 
+Forecasting yields to the browser in small batches, so the site stays interactive while the coach analyzes. If Team or Era retry is the recommendation, the retry button gets a prominent **REROLL ... NOW** label and the fallback player is not highlighted.
+
 ## Guide
 
 - Green: pick this player

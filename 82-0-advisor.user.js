@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      1.6.0
+// @version      1.7.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.6.0";
+  const VERSION = "1.7.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -50,6 +50,7 @@
   const ROLLOUT_CURRENT_ACTIONS = 24;
   const ROLLOUT_RETRY_ACTIONS = 10;
   const ROLLOUT_ROWS_PER_POSITION = 3;
+  const ANALYSIS_YIELD_EVERY = 6;
 
   // These are algebraically identical to the current production team formula.
   const COEFF_PPG = (100 * 0.46) / 133.4;
@@ -1054,6 +1055,7 @@
     lastAnalysisKey: "",
     lastAnalysis: null,
     analysisInProgressKey: "",
+    analysisGeneration: 0,
     persistedPicks: new Map(),
     pickOrder: 0,
     emptyTraySince: 0,
@@ -1183,6 +1185,8 @@
         box-shadow: 0 0 18px rgba(56,189,248,.72) !important;
       }
       [data-82coach-retry="team"] {
+        --82coach-retry-color: #f59e0b;
+        --82coach-retry-text: #241300;
         position: relative !important;
         z-index: 25 !important;
         box-sizing: border-box !important;
@@ -1194,6 +1198,8 @@
         animation: __82coachPulse 1.1s ease-in-out infinite alternate;
       }
       [data-82coach-retry="era"] {
+        --82coach-retry-color: #a855f7;
+        --82coach-retry-text: #180523;
         position: relative !important;
         z-index: 25 !important;
         box-sizing: border-box !important;
@@ -1203,6 +1209,26 @@
         outline-offset: 3px !important;
         box-shadow: inset 0 0 0 3px #a855f7, 0 0 0 9px rgba(168,85,247,.32), 0 0 34px 12px rgba(168,85,247,.9) !important;
         animation: __82coachPulse 1.1s ease-in-out infinite alternate;
+      }
+      [data-82coach-retry]::after {
+        content: attr(data-82coach-retry-label) !important;
+        position: absolute !important;
+        inset: -4px !important;
+        z-index: 2147483646 !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        padding: 3px 8px !important;
+        border: 3px solid #fff !important;
+        border-radius: 999px !important;
+        background: var(--82coach-retry-color) !important;
+        color: var(--82coach-retry-text) !important;
+        font: 950 14px/1.05 system-ui, sans-serif !important;
+        letter-spacing: .035em !important;
+        text-align: center !important;
+        text-transform: uppercase !important;
+        white-space: nowrap !important;
+        pointer-events: none !important;
       }
       [data-82coach-retry-muted="true"] { opacity:.34 !important; filter:grayscale(.8) brightness(.65) !important; }
       @keyframes __82coachPulse { from { filter:brightness(1.08); } to { filter:brightness(1.48); } }
@@ -1341,6 +1367,7 @@
         : "Turn coach on";
       clearHighlights();
       runtime.lastAdviceSignature = "";
+      if (!current.enabled) runtime.analysisInProgressKey = "";
       if (current.enabled) scheduleScan(0);
     };
     return host;
@@ -1468,6 +1495,7 @@
     runtime.lastAnalysisKey = "";
     runtime.lastAnalysis = null;
     runtime.analysisInProgressKey = "";
+    runtime.analysisGeneration += 1;
     if (document.body) scheduleScan(0);
   }
 
@@ -1665,7 +1693,7 @@
   }
 
   function renderAnalyzing() {
-    renderLoading("Analyzing this roll…");
+    renderLoading("Analyzing in the background… you can keep playing.");
   }
 
   async function loadRows() {
@@ -2050,10 +2078,26 @@
     return compareActions(left, right);
   }
 
-  function forecastEvaluation(
+  function analysisCancelledError() {
+    const error = new Error("analysis superseded");
+    error.name = "AnalysisCancelledError";
+    return error;
+  }
+
+  async function yieldToBrowser(shouldContinue = () => true) {
+    if (!shouldContinue()) throw analysisCancelledError();
+    if (typeof window.scheduler?.yield === "function") {
+      await window.scheduler.yield();
+    } else {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
+    if (!shouldContinue()) throw analysisCancelledError();
+  }
+
+  async function forecastEvaluation(
     evaluation,
     entries,
-    { samples, maxActions, seed },
+    { samples, maxActions, seed, shouldContinue = () => true },
   ) {
     if (!evaluation?.actions?.length) return evaluation;
     const fixedRows = entries.map((entry) => entry.row);
@@ -2082,6 +2126,7 @@
       samples,
       `${seed}|${fixedRows.map((row) => row.key).sort().join(";")}`,
     );
+    let workSinceYield = 0;
     for (const action of shortlist.values()) {
       const pickedRows = [...fixedRows, action.row];
       const outcomes = [];
@@ -2092,6 +2137,11 @@
           sequence,
         );
         if (raw !== null) outcomes.push(raw);
+        workSinceYield += 1;
+        if (workSinceYield >= ANALYSIS_YIELD_EVERY) {
+          workSinceYield = 0;
+          await yieldToBrowser(shouldContinue);
+        }
       }
       if (!outcomes.length) continue;
       outcomes.sort((left, right) => left - right);
@@ -2110,6 +2160,7 @@
         outcomes[Math.floor((outcomes.length - 1) * 0.25)],
       );
     }
+    if (workSinceYield) await yieldToBrowser(shouldContinue);
     evaluation.best = [...shortlist.values()].reduce((winner, action) =>
       compareForecastActions(action, winner) > 0 ? action : winner,
     null);
@@ -2475,7 +2526,12 @@
     return cells;
   }
 
-  function summarizeRetry(scope, cell, entries) {
+  async function summarizeRetry(
+    scope,
+    cell,
+    entries,
+    shouldContinue = () => true,
+  ) {
     if (
       runtime.shadowReady &&
       runtime.shadowSynced &&
@@ -2542,13 +2598,15 @@
     let pathCount = 0;
     let ceilingPathCount = 0;
     for (const alternative of cells) {
-      const result = forecastEvaluation(
+      await yieldToBrowser(shouldContinue);
+      const result = await forecastEvaluation(
         evaluateCell(alternative, entries, false),
         entries,
         {
           samples: ROLLOUT_RETRY_SAMPLES,
           maxActions: ROLLOUT_RETRY_ACTIONS,
           seed: `retry:${scope}:${cell.team}|${cell.era}:${alternative.team}|${alternative.era}`,
+          shouldContinue,
         },
       );
       if (!result.best) {
@@ -2699,6 +2757,7 @@
       element.removeAttribute("data-82coach-locked");
       element.removeAttribute("data-82coach-position");
       element.removeAttribute("data-82coach-retry");
+      element.removeAttribute("data-82coach-retry-label");
       element.removeAttribute("data-82coach-retry-muted");
       element.style.removeProperty("--82coach-color");
     }
@@ -2799,9 +2858,11 @@
     const move = advice.kind === "pick" ? fallback?.moves?.[0] : null;
 
     if (isRetry) {
-      retries[advice.kind]?.element?.setAttribute(
-        "data-82coach-retry",
-        advice.kind,
+      const retryElement = retries[advice.kind]?.element;
+      retryElement?.setAttribute("data-82coach-retry", advice.kind);
+      retryElement?.setAttribute(
+        "data-82coach-retry-label",
+        `↻ Reroll ${advice.kind} now`,
       );
       const otherKind = advice.kind === "team" ? "era" : "team";
       retries[otherKind]?.element?.setAttribute(
@@ -2827,21 +2888,18 @@
       ({ row, element }) => row.key === fallback.row.key && isVisible(element),
     )?.element;
 
-    if (card) {
+    // When a retry is best, highlighting the fallback player competes with the
+    // actual recommendation. Keep the fallback in the details panel only.
+    if (card && !isRetry) {
       card.setAttribute(
         "data-82coach-card",
-        isRetry ? `fallback-${advice.kind}` : "pick",
+        "pick",
       );
       card.setAttribute(
         "data-82coach-label",
-        isRetry
-          ? `FALLBACK · ${fallback.position}`
-          : `PICK · ${fallback.position}`,
+        `PICK · ${fallback.position}`,
       );
-      card.style.setProperty(
-        "--82coach-color",
-        isRetry ? COLORS[advice.kind] : COLORS.pick,
-      );
+      card.style.setProperty("--82coach-color", COLORS.pick);
     }
 
     if (!isRetry) {
@@ -3430,25 +3488,40 @@
       runtime.lastAdvice = null;
       if (runtime.analysisInProgressKey !== analysisKey) {
         runtime.analysisInProgressKey = analysisKey;
+        runtime.analysisGeneration += 1;
+        const analysisGeneration = runtime.analysisGeneration;
+        const stillCurrent = () =>
+          runtime.analysisInProgressKey === analysisKey &&
+          runtime.analysisGeneration === analysisGeneration &&
+          readUiState().enabled;
         requestAnimationFrame(() => {
-          window.setTimeout(() => {
-            if (runtime.analysisInProgressKey !== analysisKey) return;
+          window.setTimeout(async () => {
+            if (!stillCurrent()) return;
             try {
-              const completed = {
-                current: forecastEvaluation(evaluateCell(cell, entries), entries, {
+              const current = await forecastEvaluation(
+                evaluateCell(cell, entries),
+                entries,
+                {
                   samples: ROLLOUT_CURRENT_SAMPLES,
                   maxActions: ROLLOUT_CURRENT_ACTIONS,
                   seed: `pick:${cell.team}|${cell.era}:${entries
                     .map((entry) => entry.row.key)
                     .sort()
                     .join(";")}`,
-                }),
-                teamRetry: retries.team.available
-                  ? summarizeRetry("team", cell, entries)
-                  : null,
-                eraRetry: retries.era.available
-                  ? summarizeRetry("era", cell, entries)
-                  : null,
+                  shouldContinue: stillCurrent,
+                },
+              );
+              const teamRetry = retries.team.available
+                ? await summarizeRetry("team", cell, entries, stillCurrent)
+                : null;
+              const eraRetry = retries.era.available
+                ? await summarizeRetry("era", cell, entries, stillCurrent)
+                : null;
+              await yieldToBrowser(stillCurrent);
+              const completed = {
+                current,
+                teamRetry,
+                eraRetry,
                 priorCeiling: runtime.optimizer.relaxedCeiling(
                   entries.map((entry) => entry.row),
                 ),
@@ -3457,14 +3530,19 @@
                     ? solveExactSeededPlan(entries)
                     : null,
               };
-              if (runtime.analysisInProgressKey !== analysisKey) return;
+              if (!stillCurrent()) return;
               runtime.lastAnalysisKey = analysisKey;
               runtime.lastAnalysis = completed;
             } catch (error) {
-              console.error("[82-0 Coach] Analysis failed", error);
-              runtime.loadError = `Analysis failed: ${error.message || error}`;
+              if (error?.name !== "AnalysisCancelledError") {
+                console.error("[82-0 Coach] Analysis failed", error);
+                runtime.loadError = `Analysis failed: ${error.message || error}`;
+              }
             } finally {
-              if (runtime.analysisInProgressKey === analysisKey) {
+              if (
+                runtime.analysisInProgressKey === analysisKey &&
+                runtime.analysisGeneration === analysisGeneration
+              ) {
                 runtime.analysisInProgressKey = "";
                 scheduleScan(0);
               }
