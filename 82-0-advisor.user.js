@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      1.5.0
+// @version      1.6.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.5.0";
+  const VERSION = "1.6.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -45,10 +45,10 @@
   const RECORD_SCORE_CAP = 116;
   const TARGET_SCORE = 115.4;
   const EPSILON = 1e-10;
-  const ROLLOUT_CURRENT_SAMPLES = 16;
-  const ROLLOUT_RETRY_SAMPLES = 4;
-  const ROLLOUT_CURRENT_ACTIONS = 20;
-  const ROLLOUT_RETRY_ACTIONS = 8;
+  const ROLLOUT_CURRENT_SAMPLES = 24;
+  const ROLLOUT_RETRY_SAMPLES = 6;
+  const ROLLOUT_CURRENT_ACTIONS = 24;
+  const ROLLOUT_RETRY_ACTIONS = 10;
   const ROLLOUT_ROWS_PER_POSITION = 3;
 
   // These are algebraically identical to the current production team formula.
@@ -1067,7 +1067,6 @@
     shadowPendingCell: null,
     shadowPendingFrom: null,
     criticalStudioIds: new Set(),
-    safetyOverride: null,
     scanTimer: 0,
     scanSerial: 0,
     idleRecoveryScans: 0,
@@ -1108,13 +1107,19 @@
   function readUiState() {
     try {
       return {
+        enabled: true,
         collapsed: false,
         details: false,
         hidden: false,
         ...JSON.parse(localStorage.getItem(UI_KEY) || "{}"),
       };
     } catch (_) {
-      return { collapsed: false, details: false, hidden: false };
+      return {
+        enabled: true,
+        collapsed: false,
+        details: false,
+        hidden: false,
+      };
     }
   }
 
@@ -1172,11 +1177,6 @@
         pointer-events: none;
       }
       [data-82coach-card^="fallback"] { outline-style: dashed !important; }
-      [data-82coach-locked="true"] {
-        pointer-events: none !important;
-        opacity: .42 !important;
-        filter: grayscale(.55) saturate(.5) !important;
-      }
       [data-82coach-position="true"] {
         outline: 3px solid ${COLORS.position} !important;
         outline-offset: 3px !important;
@@ -1223,8 +1223,17 @@
         button { font: inherit; }
         #card { width:min(292px,calc(100vw - 20px)); color:#e5edf6; background:rgba(5,12,23,.965); border:1px solid #26364c; border-radius:14px; box-shadow:0 14px 38px rgba(0,0,0,.55); font:12px/1.35 system-ui,-apple-system,sans-serif; overflow:hidden; backdrop-filter:blur(12px); }
         #card.hidden { width:auto; border-radius:999px; }
+        #card.disabled { width:auto; border-radius:999px; border-color:#374151; }
         header { height:34px; padding:0 8px 0 11px; display:flex; align-items:center; gap:7px; border-bottom:1px solid #1b293b; user-select:none; }
         #card.hidden header { border:0; padding:0 6px 0 10px; }
+        #card.disabled header { border:0; padding:0 6px 0 10px; }
+        #card.disabled main,
+        #card.disabled .logo,
+        #card.disabled .mode,
+        #card.disabled #collapse,
+        #card.disabled #hide { display:none; }
+        #card.disabled .title { color:#94a3b8; }
+        #card.disabled #power { color:#4ade80; background:#10271c; }
         .logo { font-size:14px; }
         .title { font-size:10px; font-weight:900; letter-spacing:.08em; text-transform:uppercase; color:#9fb0c4; flex:1; white-space:nowrap; }
         .mode { color:#64748b; font-size:9px; font-weight:800; }
@@ -1258,8 +1267,6 @@
         .fallback { margin-top:7px; padding:6px 7px; border-radius:7px; background:#0c1726; color:#9aacbf; }
         .fallback strong { color:#e7eef7; }
         .filter-hint { margin-top:7px; padding:6px 7px; border-radius:7px; background:#17233a; color:#bfdbfe; }
-        .safety { display:flex; gap:7px; align-items:center; margin-top:8px; padding:7px; background:#351b09; border:1px solid #7c3d0a; border-radius:8px; color:#fdba74; }
-        .unlock { margin-left:auto; border:1px solid #a85a15; background:#542807; color:#fed7aa; border-radius:6px; padding:3px 6px; cursor:pointer; white-space:nowrap; }
         .legend { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; color:#60748c; font-size:9px; }
         .swatch::before { content:''; display:inline-block; width:6px; height:6px; border-radius:2px; margin-right:3px; background:var(--c); }
         .loading { padding:5px 2px; color:#93a4b8; }
@@ -1275,14 +1282,11 @@
           .name { font-size:14px; }
           .position { font-size:13px; }
           #card:not(.details-open) .sub { display:none; }
-          .safety { margin-top:4px; padding:3px 5px; font-size:9px; }
-          .safety-copy { display:none; }
-          .unlock { padding:2px 4px; }
           .details-toggle { margin-top:2px; padding:1px; }
         }
         @media (prefers-reduced-motion:reduce) { * { animation:none !important; transition:none !important; } }
       </style>
-      <div id="card"><header><span class="logo">🏀</span><span class="title">82-0 Coach</span><span class="mode"></span><button class="icon" id="collapse" title="Collapse">—</button><button class="icon" id="hide" title="Hide (Alt+A restores)">×</button></header><main id="content" role="status" aria-live="polite" aria-atomic="true"></main></div>
+      <div id="card"><header><span class="logo">🏀</span><span class="title">82-0 Coach</span><span class="mode"></span><button class="icon" id="power" title="Turn coach off">⏻</button><button class="icon" id="collapse" title="Collapse">—</button><button class="icon" id="hide" title="Hide (Alt+A restores)">×</button></header><main id="content" role="status" aria-live="polite" aria-atomic="true"></main></div>
     `;
     document.body.appendChild(host);
 
@@ -1290,7 +1294,14 @@
     const card = shadow.getElementById("card");
     card.classList.toggle("collapsed", state.collapsed);
     card.classList.toggle("hidden", state.hidden);
+    card.classList.toggle("disabled", !state.enabled);
     card.classList.toggle("details-open", state.details);
+    shadow.querySelector(".title").textContent = state.enabled
+      ? "82-0 Coach"
+      : "Coach off";
+    shadow.getElementById("power").title = state.enabled
+      ? "Turn coach off"
+      : "Turn coach on";
     shadow.getElementById("collapse").textContent = state.collapsed ? "+" : "—";
     shadow.getElementById("collapse").onclick = () => {
       const current = readUiState();
@@ -1313,6 +1324,24 @@
       shadow.getElementById("collapse").textContent = current.collapsed
         ? "+"
         : "—";
+    };
+    shadow.getElementById("power").onclick = () => {
+      const current = readUiState();
+      current.enabled = !current.enabled;
+      current.hidden = false;
+      current.collapsed = false;
+      writeUiState(current);
+      card.classList.toggle("disabled", !current.enabled);
+      card.classList.remove("hidden", "collapsed");
+      shadow.querySelector(".title").textContent = current.enabled
+        ? "82-0 Coach"
+        : "Coach off";
+      shadow.getElementById("power").title = current.enabled
+        ? "Turn coach off"
+        : "Turn coach on";
+      clearHighlights();
+      runtime.lastAdviceSignature = "";
+      if (current.enabled) scheduleScan(0);
     };
     return host;
   }
@@ -1625,15 +1654,6 @@
         scheduleScan(0);
       };
     }
-    const unlock = shadow.getElementById("unlock-picks");
-    if (unlock) {
-      unlock.onclick = () => {
-        if (!runtime.lastAdvice?.cellSignature) return;
-        runtime.safetyOverride = runtime.lastAdvice.cellSignature;
-        runtime.lastAdviceSignature = "";
-        scheduleScan(0);
-      };
-    }
   }
 
   function renderLoading(message, error = false) {
@@ -1644,20 +1664,8 @@
     );
   }
 
-  function lockForAnalysis(cards, retries) {
+  function renderAnalyzing() {
     renderLoading("Analyzing this roll…");
-    for (const { element } of cards)
-      element.setAttribute("data-82coach-locked", "true");
-    for (const position of POSITIONS) {
-      for (const target of findPositionTargets(position, {
-        includeTray: true,
-        openOnly: true,
-      })) {
-        target.setAttribute("data-82coach-locked", "true");
-      }
-    }
-    retries.team.element?.setAttribute("data-82coach-locked", "true");
-    retries.era.element?.setAttribute("data-82coach-locked", "true");
   }
 
   async function loadRows() {
@@ -2789,8 +2797,6 @@
     const fallback = advice.current?.best;
     const isRetry = advice.kind === "team" || advice.kind === "era";
     const move = advice.kind === "pick" ? fallback?.moves?.[0] : null;
-    const overridden = runtime.safetyOverride === advice.cellSignature;
-    const shouldLock = (isRetry || move) && !overridden;
 
     if (isRetry) {
       retries[advice.kind]?.element?.setAttribute(
@@ -2802,23 +2808,6 @@
         "data-82coach-retry-muted",
         "true",
       );
-    }
-
-    if (shouldLock) {
-      runtime.selectedRow = null;
-      runtime.pendingPick = null;
-      for (const { element } of cards)
-        element.setAttribute("data-82coach-locked", "true");
-      for (const position of POSITIONS) {
-        for (const target of findPositionTargets(position, {
-          includeTray: true,
-          openOnly: true,
-        })) {
-          if (!move || position !== move.to) {
-            target.setAttribute("data-82coach-locked", "true");
-          }
-        }
-      }
     }
 
     if (move) {
@@ -2985,8 +2974,6 @@
       : advice.kind === "pick" && best
         ? best.position
         : "";
-    const safetyLocked =
-      (isRetry || move) && runtime.safetyOverride !== advice.cellSignature;
     const pickedResult = calculateTeamResult(entries.map((entry) => entry.row));
     const currentLine = best ? scoreText(best.ceiling) : "—";
     const expectedLine = Number.isFinite(best?.forecastScore)
@@ -3091,7 +3078,6 @@
       </div>
       ${fallbackHtml}
       ${filterHint}
-      ${safetyLocked ? `<div class="safety"><span>🔒</span><span class="safety-copy">${move ? "Picks locked — make the highlighted move." : "Picks locked — use the highlighted retry."}</span><button class="unlock" id="unlock-picks">Pick anyway</button></div>` : ""}
       <button class="details-toggle" id="details-toggle">${ui.details ? "Hide details" : "Why this choice?"}</button>
       ${details}
     `;
@@ -3108,7 +3094,6 @@
       seeded: seededResult?.raw,
       mismatch: runtime.modelMismatch,
       details: ui.details,
-      override: runtime.safetyOverride,
       team: teamForecast,
       era: eraForecast,
     });
@@ -3208,7 +3193,6 @@
     runtime.lastAnalysisKey = "";
     runtime.lastAnalysis = null;
     runtime.analysisInProgressKey = "";
-    runtime.safetyOverride = null;
     runtime.lastAdviceSignature = "";
     runtime.persistedPicks.clear();
     runtime.pickOrder = 0;
@@ -3235,32 +3219,7 @@
     return controlPosition(button);
   }
 
-  function interactionGuard(event) {
-    const advice = runtime.lastAdvice;
-    const isRetry = advice && (advice.kind === "team" || advice.kind === "era");
-    const needsMove =
-      advice?.kind === "pick" && advice.current?.best?.moves?.length > 0;
-    const analysisLocked = Boolean(runtime.analysisInProgressKey);
-    if (
-      (!isRetry && !needsMove && !analysisLocked) ||
-      (!analysisLocked && runtime.safetyOverride === advice?.cellSignature)
-    )
-      return false;
-    const locked = event
-      .composedPath?.()
-      .some(
-        (node) =>
-          node instanceof Element &&
-          node.getAttribute("data-82coach-locked") === "true",
-      );
-    if (!locked && !analysisLocked) return false;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    return true;
-  }
-
   function handleDocumentClick(event) {
-    if (interactionGuard(event)) return;
     const button = event.target.closest?.("button,a");
     const text = (button?.textContent || "")
       .replace(/\s+/g, " ")
@@ -3303,7 +3262,6 @@
       commitShadowRetry(button === retryButtons.team.element ? "team" : "era");
       runtime.selectedRow = null;
       runtime.pendingPick = null;
-      runtime.safetyOverride = null;
       runtime.lastAnalysisKey = "";
       runtime.lastAnalysis = null;
       scheduleScan(80);
@@ -3339,7 +3297,6 @@
   }
 
   function handleDragStart(event) {
-    if (interactionGuard(event)) return;
     const row = rowFromCard(
       event.target.closest?.('[data-testid="player-card"],div[draggable]'),
     );
@@ -3347,7 +3304,6 @@
   }
 
   function handleDrop(event) {
-    if (interactionGuard(event)) return;
     const position = inferPositionTarget(event.target);
     if (position && runtime.selectedRow?.positions.includes(position)) {
       runtime.pendingPick = {
@@ -3387,7 +3343,7 @@
     detectModeFromPage();
     if (!runtime.dataReady) {
       renderLoading(
-        runtime.loadError || "Loading player peaks and exact optimizer…",
+        runtime.loadError || "Loading player peaks and expected-value optimizer…",
         Boolean(runtime.loadError),
       );
       return;
@@ -3396,6 +3352,12 @@
     const cards = findCards();
     const cell = parseCell(cards);
     const trayState = reconcileRoster(cell);
+    if (!readUiState().enabled) {
+      clearHighlights();
+      runtime.lastAdvice = null;
+      runtime.analysisInProgressKey = "";
+      return;
+    }
     if (renderResultsIfPresent()) return;
     if (!cell || !getPlayerListRoot() || !trayState.present) {
       clearHighlights();
@@ -3426,7 +3388,6 @@
     ) {
       runtime.selectedRow = null;
       runtime.pendingPick = null;
-      runtime.safetyOverride = null;
       runtime.lastAdvice = null;
       runtime.lastAnalysisKey = "";
       runtime.lastAnalysis = null;
@@ -3449,7 +3410,7 @@
     const retries = findRetryButtons();
     const shadowState = syncShadowToCell(cell);
     if (shadowState === "waiting") {
-      lockForAnalysis(cards, retries);
+      renderAnalyzing();
       return;
     }
     const analysisKey = `${cell.team}|${cell.era}|${entries
@@ -3465,7 +3426,7 @@
     let analysis =
       runtime.lastAnalysisKey === analysisKey ? runtime.lastAnalysis : null;
     if (!analysis) {
-      lockForAnalysis(cards, retries);
+      renderAnalyzing();
       runtime.lastAdvice = null;
       if (runtime.analysisInProgressKey !== analysisKey) {
         runtime.analysisInProgressKey = analysisKey;
@@ -3593,7 +3554,7 @@
       characterData: true,
     });
 
-    renderLoading("Loading player peaks and exact optimizer…");
+    renderLoading("Loading player peaks and expected-value optimizer…");
     loadRows()
       .then(() => scheduleScan(0))
       .catch((error) => {
