@@ -282,6 +282,45 @@ assert.deepEqual(
 );
 assert.equal(augmentingPlan.position, "PG");
 
+const loopData = normalizeDataset([
+  row("Luka Doncic", "DAL", "2020s", ["PG", "SG", "SF"], 30, 9, 9, 1, 0.5),
+  row("James Harden", "HOU", "2010s", ["PG", "SG"], 29, 7, 9, 1.7, 0.6),
+  row("Allen Iverson", "PHI", "2000s", ["PG", "SG"], 33, 4, 7, 2.5, 0.2),
+]);
+const [luka, harden, iverson] = loopData.rows;
+const stableIversonPlan = shortestPlacementPlan(
+  reachableRosterStates([
+    { row: luka, position: "PG" },
+    { row: harden, position: "SG" },
+  ]),
+  iverson,
+  (1 << 0) | (1 << 1) | (1 << 2),
+  "SG",
+);
+assert.deepEqual(
+  stableIversonPlan.moves.map(({ player, from, to, swapPlayer }) => [
+    player,
+    from,
+    to,
+    swapPlayer,
+  ]),
+  [
+    ["Luka Doncic", "PG", "SF", null],
+    ["James Harden", "SG", "PG", null],
+  ],
+  "multi-step placement must advance through the empty slot instead of swapping Luka and Harden",
+);
+
+for (const state of reachableRosterStates([
+  { row: luka, position: "PG" },
+  { row: harden, position: "SG" },
+])) {
+  assert.ok(
+    state.moves.every((move) => move.swapPlayer === null),
+    "reachable movement plans must never contain reversible occupied-slot swaps",
+  );
+}
+
 const rng = new MulberryRng(1);
 assert.equal(rng.next(), 0.6270739405881613);
 assert.equal(rng.next(), 0.002735721180215478);

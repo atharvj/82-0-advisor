@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.1.1
+// @version      2.1.2
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.1.1";
+  const VERSION = "2.1.2";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -693,11 +693,14 @@
         if (!moving) continue;
         for (let to = 0; to < 5; to += 1) {
           if (from === to || !(moving.posMask & (1 << to))) continue;
-          const displaced = state.slots[to];
-          if (displaced && !(displaced.posMask & (1 << from))) continue;
+          // Only move into the current empty slot. Occupied-position swaps can
+          // mirror the lineup and make the next scan recommend the reverse
+          // swap forever. Empty-slot moves follow a stable augmenting path:
+          // every step opens the position needed by the following step.
+          if (state.slots[to]) continue;
           const slots = [...state.slots];
           slots[to] = moving;
-          slots[from] = displaced || null;
+          slots[from] = null;
           const key = rosterStateKey(slots);
           if (seen.has(key)) continue;
           seen.add(key);
@@ -709,7 +712,7 @@
                 player: moving.player,
                 from: POSITIONS[from],
                 to: POSITIONS[to],
-                swapPlayer: displaced?.player || null,
+                swapPlayer: null,
               },
             ],
           });
@@ -3519,8 +3522,18 @@
       if (occupiedMask(entries) & bit) return false;
       return advice.kind !== "pick" || move || openPosition !== best?.position;
     });
+    const remainingMoveRoute = move
+      ? [
+          ...(best.moves || [])
+            .slice(1)
+            .map((nextMove) =>
+              `move ${nextMove.player} ${nextMove.from} → ${nextMove.to}`,
+            ),
+          `pick ${best.row.player} → ${best.position}`,
+        ].join("; then ")
+      : "";
     const subline = move
-      ? `Then pick ${best.row.player} → ${best.position}`
+      ? `Then ${remainingMoveRoute}`
       : isRetry
         ? advice.reason
         : stats;
