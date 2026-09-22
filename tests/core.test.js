@@ -11,6 +11,7 @@ const {
   bestRolloutSequenceRaw,
   reachableRosterStates,
   shortestPlacementPlan,
+  movePlanUpgradesOccupiedPosition,
   MulberryRng,
   buildStudioDrawIndex,
   criticalStudioPlayerIds,
@@ -22,22 +23,22 @@ function row(player, team, era, positions, ppg, rpg, apg, spg, bpg) {
   return { player, team, era, positions, ppg, rpg, apg, spg, bpg };
 }
 
-assert.equal(TARGET_SCORE, 115.4);
-assert.equal(projectedWins(115.3), 81, "115.3 must remain an 81-win score");
+assert.equal(TARGET_SCORE, 109.5);
+assert.equal(projectedWins(109.4), 81, "109.4 must remain an 81-win score");
 assert.equal(
-  projectedWins(115.4),
+  projectedWins(109.5),
   82,
-  "115.4 is the first displayed 82-win score",
+  "109.5 is the first displayed 82-win score",
 );
 assert.equal(
   projectedWins(91.3),
-  62,
+  66,
   "record projection must match the planning expectation curve",
 );
 assert.equal(
   projectedWins(98),
-  68,
-  "planning uses an expected record; final server simulations may vary",
+  72,
+  "planning curve must match the signed-in result shown by the site",
 );
 
 const knownMaximum = [
@@ -149,6 +150,35 @@ assert.deepEqual(
   "the coach must move a flexible prior pick before placing a PG-only candidate",
 );
 assert.equal(oneMovePlan.position, "PG");
+assert.equal(
+  movePlanUpgradesOccupiedPosition(
+    [{ row: moveA, position: "PG" }],
+    moveCandidate,
+    oneMovePlan,
+  ),
+  false,
+  "an equal current-roll player must not trigger a speculative position move",
+);
+
+const strongerMovementData = normalizeDataset([
+  row("Incumbent", "AAA", "2020s", ["PG", "SG"], 5, 1, 1, 0, 0),
+  row("Upgrade", "BBB", "2020s", ["PG"], 25, 5, 5, 1, 0),
+]);
+const [incumbent, upgrade] = strongerMovementData.rows;
+const upgradePlan = shortestPlacementPlan(
+  reachableRosterStates([{ row: incumbent, position: "PG" }]),
+  upgrade,
+  (1 << 0) | (1 << 1),
+);
+assert.equal(
+  movePlanUpgradesOccupiedPosition(
+    [{ row: incumbent, position: "PG" }],
+    upgrade,
+    upgradePlan,
+  ),
+  true,
+  "a clearly stronger roll may move the incumbent out of its occupied slot",
+);
 
 const augmentingPlan = shortestPlacementPlan(
   reachableRosterStates([

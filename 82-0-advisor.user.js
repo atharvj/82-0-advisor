@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      1.9.0
+// @version      2.0.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.9.0";
+  const VERSION = "2.0.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -39,20 +39,22 @@
     "2010s",
     "2020s",
   ]);
-  // The live server maps a displayed team score to wins as
-  // Expected record curve used for planning. The production server can vary
-  // the final simulated record, so the result screen always prefers its
-  // authoritative score_display payload over this expectation.
-  const RECORD_SCORE_CAP = 116;
-  const TARGET_SCORE = 115.4;
+  // Current public reverse engineering and the signed-in result screen both
+  // put the first displayed 82-win score at 109.5 on the 110-point curve. The
+  // result screen still prefers the site's returned record over this forecast.
+  const RECORD_SCORE_CAP = 110;
+  const TARGET_SCORE = 109.5;
   const EPSILON = 1e-10;
-  const ROLLOUT_CURRENT_SAMPLES = 24;
-  const ROLLOUT_RETRY_SAMPLES = 6;
-  const ROLLOUT_CURRENT_ACTIONS = 24;
-  const ROLLOUT_RETRY_ACTIONS = 10;
+  const ROLLOUT_CURRENT_SAMPLES = 32;
+  const ROLLOUT_RETRY_SAMPLES = 8;
+  const ROLLOUT_CURRENT_ACTIONS = 28;
+  const ROLLOUT_RETRY_ACTIONS = 12;
   const ROLLOUT_ROWS_PER_POSITION = 3;
-  const ANALYSIS_SLICE_MS = 8;
-  const ANALYSIS_NODE_CHECK_EVERY = 32;
+  const ONE_V_ONE_CURRENT_SAMPLES = 6;
+  const ONE_V_ONE_RETRY_SAMPLES = 2;
+  const ONE_V_ONE_CURRENT_ACTIONS = 10;
+  const ONE_V_ONE_RETRY_ACTIONS = 5;
+  const ANALYSIS_YIELD_EVERY = 6;
 
   // These are algebraically identical to the current production team formula.
   const COEFF_PPG = (100 * 0.46) / 133.4;
@@ -216,60 +218,6 @@
     };
 
     visit(0, occupied);
-    return Number.isFinite(bestRaw) ? bestRaw : null;
-  }
-
-  async function bestRolloutSequenceRawCooperative(
-    fixedRows,
-    occupied,
-    futurePools,
-    budget,
-    rowsPerPosition = ROLLOUT_ROWS_PER_POSITION,
-  ) {
-    if (!futurePools.length) return rawTeamScore(fixedRows);
-    const usedNames = new Set(fixedRows.map((row) => row.player));
-    const picked = [...fixedRows];
-    let bestRaw = Number.NEGATIVE_INFINITY;
-    let visitedNodes = 0;
-
-    const visit = async (round, mask) => {
-      visitedNodes += 1;
-      if (visitedNodes % ANALYSIS_NODE_CHECK_EVERY === 0) {
-        await yieldIfNeeded(budget);
-      }
-      if (round === futurePools.length) {
-        bestRaw = Math.max(bestRaw, rawTeamScore(picked));
-        return;
-      }
-      const pool = futurePools[round] || [];
-      const candidates = [];
-      const seen = new Set();
-      for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
-        const bit = 1 << positionIndex;
-        if (mask & bit) continue;
-        const strongest = pool
-          .filter(
-            (row) => row.posMask & bit && !usedNames.has(row.player),
-          )
-          .sort((left, right) => rolloutRowValue(right) - rolloutRowValue(left))
-          .slice(0, rowsPerPosition);
-        for (const row of strongest) {
-          const key = `${row.key}@${positionIndex}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          candidates.push({ row, bit });
-        }
-      }
-      for (const candidate of candidates) {
-        usedNames.add(candidate.row.player);
-        picked.push(candidate.row);
-        await visit(round + 1, mask | candidate.bit);
-        picked.pop();
-        usedNames.delete(candidate.row.player);
-      }
-    };
-
-    await visit(0, occupied);
     return Number.isFinite(bestRaw) ? bestRaw : null;
   }
 
@@ -782,6 +730,71 @@
     return best;
   }
 
+  function movePlanUpgradesOccupiedPosition(entries, row, plan) {
+    if (!plan?.moves?.length) return true;
+    const incumbent = (entries || []).find(
+      (entry) => entry.position === plan.position,
+    )?.row;
+    if (!incumbent) return false;
+    return rawTeamScore([row]) > rawTeamScore([incumbent]) + EPSILON;
+  }
+
+  function permittedPlacement(row, entries, fixedRows, optimizer) {
+    const initialState = reachableRosterStates(entries)[0];
+    if (!initialState) return null;
+
+    // An open compatible slot never needs a reshuffle. Position changes are
+    // reserved for cases where the new roll cannot otherwise fit.
+    let best = null;
+    for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+      const bit = 1 << positionIndex;
+      if (initialState.slots[positionIndex] || !(row.posMask & bit)) continue;
+      const postMask = occupiedMask(entries) | bit;
+      const ceiling = optimizer.ceilingForMask(
+        [...fixedRows, row],
+        postMask,
+        false,
+      );
+      if (!ceiling) continue;
+      const candidate = {
+        plan: {
+          position: POSITIONS[positionIndex],
+          postMask,
+          moves: [],
+          slots: initialState.slots,
+        },
+        ceiling,
+      };
+      if (!best || ceiling.raw > best.ceiling.raw + EPSILON) best = candidate;
+    }
+    if (best) return best;
+
+    // If every compatible slot is occupied, allow a reshuffle only when the
+    // current-roll player is genuinely stronger than the player whose slot it
+    // takes. This prevents speculative moves made solely for future flexibility.
+    for (const state of reachableRosterStates(entries)) {
+      const plan = shortestPlacementPlan([state], row);
+      if (!plan || !movePlanUpgradesOccupiedPosition(entries, row, plan))
+        continue;
+      const ceiling = optimizer.ceilingForMask(
+        [...fixedRows, row],
+        plan.postMask,
+        false,
+      );
+      if (!ceiling) continue;
+      const candidate = { plan, ceiling };
+      if (
+        !best ||
+        ceiling.raw > best.ceiling.raw + EPSILON ||
+        (Math.abs(ceiling.raw - best.ceiling.raw) <= EPSILON &&
+          plan.moves.length < best.plan.moves.length)
+      ) {
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
   class MulberryRng {
     constructor(seed) {
       this.state = Number(seed) >>> 0;
@@ -1001,6 +1014,7 @@
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
+    movePlanUpgradesOccupiedPosition,
     MulberryRng,
     buildStudioDrawIndex,
     criticalStudioPlayerIds,
@@ -1360,6 +1374,11 @@
         .legend { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; color:#60748c; font-size:9px; }
         .swatch::before { content:''; display:inline-block; width:6px; height:6px; border-radius:2px; margin-right:3px; background:var(--c); }
         .loading { padding:5px 2px; color:#93a4b8; }
+        .analyzing-dots { display:inline-flex; gap:3px; margin-left:5px; vertical-align:middle; }
+        .analyzing-dots i { width:4px; height:4px; border-radius:50%; background:#38bdf8; animation:analyzing-dot 1s ease-in-out infinite; }
+        .analyzing-dots i:nth-child(2) { animation-delay:.16s; }
+        .analyzing-dots i:nth-child(3) { animation-delay:.32s; }
+        @keyframes analyzing-dot { 0%,70%,100% { opacity:.25; transform:translateY(0); } 35% { opacity:1; transform:translateY(-2px); } }
         .error { color:#fca5a5; }
         @media (max-width:767px) {
           #card { width:min(238px,calc(100vw - 16px)); }
@@ -1757,7 +1776,11 @@
   }
 
   function renderAnalyzing() {
-    renderLoading("Analyzing the roll");
+    clearHighlights();
+    renderPanel(
+      '<div class="loading"><span>Analyzing the roll</span><span class="analyzing-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>',
+      "loading:analyzing",
+    );
   }
 
   async function loadRows() {
@@ -2055,58 +2078,23 @@
     );
   }
 
-  async function evaluateCell(
-    cell,
-    entries,
-    withPlans = true,
-    budget,
-  ) {
+  function evaluateCell(cell, entries, withPlans = true) {
     const fixedRows = entries.map((entry) => entry.row);
     const usedNames = new Set(fixedRows.map((row) => row.player));
-    const states = reachableRosterStates(entries);
     const rows = runtime.byCell.get(`${cell.team}|${cell.era}`) || [];
     let best = null;
     const actions = [];
 
     for (const row of rows) {
-      // relaxedCeiling is the largest indivisible unit in this pass. Check the
-      // time budget before every player so input, scrolling, and animations
-      // run between short slices instead of waiting for the whole pool.
-      await yieldIfNeeded(budget);
       if (usedNames.has(row.player)) continue;
-      let ceiling = runtime.optimizer.relaxedCeiling(
-        [...fixedRows, row],
-        false,
+      const placement = permittedPlacement(
+        row,
+        entries,
+        fixedRows,
+        runtime.optimizer,
       );
-      if (!ceiling) continue;
-      let plan = shortestPlacementPlan(states, row, ceiling.occupiedMask);
-
-      // Defensive fallback: score every reachable occupied mask if a future site
-      // movement-rule change makes the relaxed optimum unreachable.
-      if (!plan) {
-        const placements = new Map();
-        for (const state of states) {
-          const candidate = shortestPlacementPlan([state], row);
-          if (!candidate) continue;
-          const prior = placements.get(candidate.postMask);
-          if (!prior || candidate.moves.length < prior.moves.length) {
-            placements.set(candidate.postMask, candidate);
-          }
-        }
-        ceiling = null;
-        for (const candidate of placements.values()) {
-          const result = runtime.optimizer.ceilingForMask(
-            [...fixedRows, row],
-            candidate.postMask,
-            false,
-          );
-          if (result && (!ceiling || result.raw > ceiling.raw + EPSILON)) {
-            ceiling = result;
-            plan = candidate;
-          }
-        }
-      }
-      if (!ceiling || !plan) continue;
+      if (!placement) continue;
+      const { ceiling, plan } = placement;
       const action = {
         row,
         position: plan.position,
@@ -2131,12 +2119,22 @@
 
   function sampledFuturePools(rounds, sampleCount, seedText) {
     if (rounds <= 0) return [[]];
-    const keys = [...runtime.byCell.keys()].sort();
-    if (!keys.length) return [];
+    const keysByEra = new Map();
+    for (const key of [...runtime.byCell.keys()].sort()) {
+      const era = key.split("|")[1];
+      if (!keysByEra.has(era)) keysByEra.set(era, []);
+      keysByEra.get(era).push(key);
+    }
+    const eras = [...keysByEra.keys()].sort();
+    if (!eras.length) return [];
     const rng = new MulberryRng(hashText(seedText));
     return Array.from({ length: sampleCount }, () =>
       Array.from({ length: rounds }, () => {
-        const key = keys[Math.floor(rng.next() * keys.length)];
+        // The slot machine draws an era first, then a valid team in that era.
+        // Sampling cells uniformly badly underweights rare 1960s/1970s teams.
+        const era = eras[Math.floor(rng.next() * eras.length)];
+        const eraKeys = keysByEra.get(era);
+        const key = eraKeys[Math.floor(rng.next() * eraKeys.length)];
         return runtime.byCell.get(key) || [];
       }),
     );
@@ -2144,11 +2142,33 @@
 
   function compareForecastActions(left, right) {
     if (!right) return 1;
+    const leftPath =
+      left.forecastPathRate ?? Number(left.ceiling.possible82);
+    const rightPath =
+      right.forecastPathRate ?? Number(right.ceiling.possible82);
+    if (Math.abs(leftPath - rightPath) > EPSILON)
+      return leftPath > rightPath ? 1 : -1;
     const leftForecast = left.forecastRaw ?? left.ceiling.raw;
     const rightForecast = right.forecastRaw ?? right.ceiling.raw;
     if (Math.abs(leftForecast - rightForecast) > EPSILON)
       return leftForecast > rightForecast ? 1 : -1;
     return compareActions(left, right);
+  }
+
+  function rolloutLimits() {
+    return runtime.mode === "1v1"
+      ? {
+          currentSamples: ONE_V_ONE_CURRENT_SAMPLES,
+          retrySamples: ONE_V_ONE_RETRY_SAMPLES,
+          currentActions: ONE_V_ONE_CURRENT_ACTIONS,
+          retryActions: ONE_V_ONE_RETRY_ACTIONS,
+        }
+      : {
+          currentSamples: ROLLOUT_CURRENT_SAMPLES,
+          retrySamples: ROLLOUT_RETRY_SAMPLES,
+          currentActions: ROLLOUT_CURRENT_ACTIONS,
+          retryActions: ROLLOUT_RETRY_ACTIONS,
+        };
   }
 
   function analysisCancelledError() {
@@ -2167,22 +2187,10 @@
     if (!shouldContinue()) throw analysisCancelledError();
   }
 
-  function createAnalysisBudget(shouldContinue) {
-    return { shouldContinue, sliceStarted: performance.now() };
-  }
-
-  async function yieldIfNeeded(budget, force = false) {
-    if (!budget?.shouldContinue?.()) throw analysisCancelledError();
-    if (!force && performance.now() - budget.sliceStarted < ANALYSIS_SLICE_MS)
-      return;
-    await yieldToBrowser(budget.shouldContinue);
-    budget.sliceStarted = performance.now();
-  }
-
   async function forecastEvaluation(
     evaluation,
     entries,
-    { samples, maxActions, seed, budget },
+    { samples, maxActions, seed, shouldContinue = () => true },
   ) {
     if (!evaluation?.actions?.length) return evaluation;
     const fixedRows = entries.map((entry) => entry.row);
@@ -2211,18 +2219,22 @@
       samples,
       `${seed}|${fixedRows.map((row) => row.key).sort().join(";")}`,
     );
+    let workSinceYield = 0;
     for (const action of shortlist.values()) {
       const pickedRows = [...fixedRows, action.row];
       const outcomes = [];
       for (const sequence of sequences) {
-        const raw = await bestRolloutSequenceRawCooperative(
+        const raw = bestRolloutSequenceRaw(
           pickedRows,
           action.ceiling.occupiedMask,
           sequence,
-          budget,
         );
         if (raw !== null) outcomes.push(raw);
-        await yieldIfNeeded(budget);
+        workSinceYield += 1;
+        if (workSinceYield >= ANALYSIS_YIELD_EVERY) {
+          workSinceYield = 0;
+          await yieldToBrowser(shouldContinue);
+        }
       }
       if (!outcomes.length) continue;
       outcomes.sort((left, right) => left - right);
@@ -2241,7 +2253,7 @@
         outcomes[Math.floor((outcomes.length - 1) * 0.25)],
       );
     }
-    await yieldIfNeeded(budget);
+    if (workSinceYield) await yieldToBrowser(shouldContinue);
     evaluation.best = [...shortlist.values()].reduce((winner, action) =>
       compareForecastActions(action, winner) > 0 ? action : winner,
     null);
@@ -2611,7 +2623,7 @@
     scope,
     cell,
     entries,
-    budget,
+    shouldContinue = () => true,
   ) {
     if (
       runtime.shadowReady &&
@@ -2622,12 +2634,7 @@
       const predicted = shadow.respin(scope);
       if (!predicted) return null;
       const predictedCell = { team: predicted.team, era: predicted.era };
-      const result = await evaluateCell(
-        predictedCell,
-        entries,
-        false,
-        budget,
-      );
+      const result = evaluateCell(predictedCell, entries, false);
       const action = result.best;
       const otherScope = scope === "team" ? "era" : "team";
       let chain = null;
@@ -2636,13 +2643,10 @@
         const chainedDraw = chainedShadow.respin(otherScope);
         if (chainedDraw) {
           const chainedCell = { team: chainedDraw.team, era: chainedDraw.era };
-          const chainedAction = (
-            await evaluateCell(
-              chainedCell,
-              entries,
-              false,
-              budget,
-            )
+          const chainedAction = evaluateCell(
+            chainedCell,
+            entries,
+            false,
           ).best;
           chain = {
             scope: otherScope,
@@ -2690,16 +2694,17 @@
     let totalWins = 0;
     let pathCount = 0;
     let ceilingPathCount = 0;
+    const limits = rolloutLimits();
     for (const alternative of cells) {
-      await yieldIfNeeded(budget);
+      await yieldToBrowser(shouldContinue);
       const result = await forecastEvaluation(
-        await evaluateCell(alternative, entries, false, budget),
+        evaluateCell(alternative, entries, false),
         entries,
         {
-          samples: ROLLOUT_RETRY_SAMPLES,
-          maxActions: ROLLOUT_RETRY_ACTIONS,
+          samples: limits.retrySamples,
+          maxActions: limits.retryActions,
           seed: `retry:${scope}:${cell.team}|${cell.era}:${alternative.team}|${alternative.era}`,
-          budget,
+          shouldContinue,
         },
       );
       if (!result.best) {
@@ -2795,17 +2800,19 @@
     const retryLegal = (retry) =>
       retry?.reachableLegal ?? retry?.legalCount > 0;
     const retryValue = (retry) => retry?.decisionRaw ?? retry?.meanRaw ?? 0;
+    const retryPath = (retry) =>
+      retry?.reachablePath ? 1 : retry?.pathRate ?? 0;
     const availableRetries = [
       retries.team.available && teamRetry ? teamRetry : null,
       retries.era.available && eraRetry ? eraRetry : null,
     ].filter(retryLegal);
     const bestRetry = availableRetries.reduce((winner, retry) => {
       if (!winner) return retry;
+      if (Math.abs(retryPath(retry) - retryPath(winner)) > EPSILON) {
+        return retryPath(retry) > retryPath(winner) ? retry : winner;
+      }
       if (Math.abs(retryValue(retry) - retryValue(winner)) > EPSILON) {
         return retryValue(retry) > retryValue(winner) ? retry : winner;
-      }
-      if (Math.abs(retry.pathRate - winner.pathRate) > EPSILON) {
-        return retry.pathRate > winner.pathRate ? retry : winner;
       }
       return winner;
     }, null);
@@ -2823,7 +2830,18 @@
     const slotsAfterPick = Math.max(0, openSlots - 1);
     const saveMargin = slotsAfterPick === 0 ? 0 : 0.65 + 0.2 * slotsAfterPick;
     const currentValue = current.best.forecastRaw ?? current.best.ceiling.raw;
+    const currentPath =
+      current.best.forecastPathRate ?? Number(current.best.ceiling.possible82);
+    const pathGain = retryPath(bestRetry) - currentPath;
     const expectedGain = retryValue(bestRetry) - currentValue;
+    if (pathGain > EPSILON) {
+      return {
+        kind: bestRetry.scope,
+        reason: bestRetry.chainRecommended
+          ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; this is the stronger route to 82-0.`
+          : `This retry gives the stronger sampled route to 82-0 (${Math.round(currentPath * 100)}% → ${Math.round(retryPath(bestRetry) * 100)}%).`,
+      };
+    }
     if (expectedGain > saveMargin + EPSILON) {
       return {
         kind: bestRetry.scope,
@@ -3309,8 +3327,8 @@
     const color = possible82 ? COLORS.pick : COLORS.impossible;
     const sourceLine = official
       ? calculated
-        ? "Official server record · score independently recomputed from all five peaks."
-        : "Official server result."
+        ? "Final result from 82-0 · score checked from all five selected peaks."
+        : "Final result shown by 82-0."
       : "Record projected with the current 82-0 curve; score exactly recomputed from all five peaks.";
     renderPanel(
       `<div class="status" style="--status:${color}"><span class="dot"></span><span>${possible82 ? "82-0 achieved" : "Final team"}</span></div>
@@ -3626,31 +3644,31 @@
           runtime.analysisInProgressKey === analysisKey &&
           runtime.analysisGeneration === analysisGeneration &&
           readUiState().enabled;
-        const budget = createAnalysisBudget(stillCurrent);
         requestAnimationFrame(() => {
           window.setTimeout(async () => {
             if (!stillCurrent()) return;
             try {
+              const limits = rolloutLimits();
               const current = await forecastEvaluation(
-                await evaluateCell(cell, entries, true, budget),
+                evaluateCell(cell, entries, true),
                 entries,
                 {
-                  samples: ROLLOUT_CURRENT_SAMPLES,
-                  maxActions: ROLLOUT_CURRENT_ACTIONS,
+                  samples: limits.currentSamples,
+                  maxActions: limits.currentActions,
                   seed: `pick:${cell.team}|${cell.era}:${entries
                     .map((entry) => entry.row.key)
                     .sort()
                     .join(";")}`,
-                  budget,
+                  shouldContinue: stillCurrent,
                 },
               );
               const teamRetry = retries.team.available
-                ? await summarizeRetry("team", cell, entries, budget)
+                ? await summarizeRetry("team", cell, entries, stillCurrent)
                 : null;
               const eraRetry = retries.era.available
-                ? await summarizeRetry("era", cell, entries, budget)
+                ? await summarizeRetry("era", cell, entries, stillCurrent)
                 : null;
-              await yieldIfNeeded(budget, true);
+              await yieldToBrowser(stillCurrent);
               const completed = {
                 current,
                 teamRetry,
@@ -3702,7 +3720,14 @@
           seededPlan.first.postMask,
           seededPlan.first.position,
         );
-        if (placement) {
+        if (
+          placement &&
+          movePlanUpgradesOccupiedPosition(
+            entries,
+            seededPlan.first.row,
+            placement,
+          )
+        ) {
           current = {
             ...current,
             best: {
