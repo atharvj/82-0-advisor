@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.1.0
+// @version      2.1.1
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.1.0";
+  const VERSION = "2.1.1";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -47,16 +47,19 @@
   const RECORD_SCORE_CAP = 110;
   const TARGET_SCORE = 109.5;
   const EPSILON = 1e-10;
-  const ROLLOUT_CURRENT_SAMPLES = 42;
+  const ROLLOUT_CURRENT_SAMPLES = 28;
   const ROLLOUT_RETRY_SAMPLES = 7;
-  const ROLLOUT_CURRENT_ACTIONS = 48;
-  const ROLLOUT_RETRY_ACTIONS = 2;
+  const ROLLOUT_CURRENT_ACTIONS = 32;
+  const ROLLOUT_RETRY_ACTIONS = 1;
   const ROLLOUT_ROWS_PER_POSITION = 3;
   const ONE_V_ONE_CURRENT_SAMPLES = 7;
   const ONE_V_ONE_RETRY_SAMPLES = 7;
-  const ONE_V_ONE_CURRENT_ACTIONS = 12;
+  const ONE_V_ONE_CURRENT_ACTIONS = 8;
   const ONE_V_ONE_RETRY_ACTIONS = 1;
   const ANALYSIS_YIELD_EVERY = 6;
+  const CURRENT_ANALYSIS_MAX_MS = 5_000;
+  const RETRY_ANALYSIS_MAX_MS = 1_500;
+  const ONE_V_ONE_ANALYSIS_MAX_MS = 900;
   const PATH_CONFIDENCE_Z = 1.645;
   const MIN_PATH_ADVANTAGE = 0.08;
 
@@ -1036,6 +1039,7 @@
     meaningfulRateAdvantage,
     bestRolloutSequenceRaw,
     stratifiedFutureKeys,
+    rolloutCandidateShortlist,
     roundOne,
     positionMask,
     reachableRosterStates,
@@ -2263,6 +2267,42 @@
     );
   }
 
+  function rolloutCandidateShortlist(picked, mask, pool) {
+    const usedNames = new Set(picked.map((row) => row.player));
+    const candidates = [];
+    for (const row of pool || []) {
+      if (usedNames.has(row.player)) continue;
+      const partialRaw = rawTeamScore([...picked, row]);
+      const baseValue = rolloutRowValue(row);
+      for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+        const bit = 1 << positionIndex;
+        if (mask & bit || !(row.posMask & bit)) continue;
+        candidates.push({ row, bit, positionIndex, partialRaw, baseValue });
+      }
+    }
+    if (candidates.length <= 16) return candidates;
+
+    const selected = new Map();
+    const add = (candidate) =>
+      selected.set(`${candidate.row.key}@${candidate.positionIndex}`, candidate);
+    for (const candidate of [...candidates]
+      .sort((left, right) => right.partialRaw - left.partialRaw)
+      .slice(0, 8))
+      add(candidate);
+    for (const candidate of [...candidates]
+      .sort((left, right) => right.baseValue - left.baseValue)
+      .slice(0, 4))
+      add(candidate);
+    for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+      for (const candidate of candidates
+        .filter((item) => item.positionIndex === positionIndex)
+        .sort((left, right) => right.partialRaw - left.partialRaw)
+        .slice(0, 2))
+        add(candidate);
+    }
+    return [...selected.values()];
+  }
+
   function rolloutSequencePolicyRaw(fixedRows, occupied, futurePools) {
     const picked = [...fixedRows];
     const usedNames = new Set(picked.map((row) => row.player));
@@ -2270,11 +2310,9 @@
 
     for (const pool of futurePools) {
       let best = null;
-      for (const row of pool || []) {
-        if (usedNames.has(row.player)) continue;
-        for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
-          const bit = 1 << positionIndex;
-          if (mask & bit || !(row.posMask & bit)) continue;
+      const finalists = rolloutCandidateShortlist(picked, mask, pool);
+      for (const finalist of finalists) {
+          const { row, bit, partialRaw } = finalist;
           const postMask = mask | bit;
           const ceiling = runtime.optimizer.ceilingForMask(
             [...picked, row],
@@ -2282,7 +2320,6 @@
             false,
           );
           if (!ceiling) continue;
-          const partialRaw = rawTeamScore([...picked, row]);
           // Benchmarked on balanced draws from the current 10,621-row pool.
           // Pure ceiling chasing averaged 65.3 wins; this 75/25 blend averaged
           // 66.7 by valuing production now without ignoring slot flexibility.
@@ -2302,7 +2339,6 @@
           ) {
             best = candidate;
           }
-        }
       }
       if (!best) return null;
       picked.push(best.row);
@@ -2393,6 +2429,7 @@
       maxActions,
       seed,
       retryCount = 0,
+      deadline = Number.POSITIVE_INFINITY,
       shouldContinue = () => true,
     },
   ) {
@@ -2424,10 +2461,13 @@
       `${seed}|${fixedRows.map((row) => row.key).sort().join(";")}`,
     );
     let workSinceYield = 0;
+    const forecasted = [];
     for (const action of shortlist.values()) {
+      if (forecasted.length && performance.now() >= deadline) break;
       const pickedRows = [...fixedRows, action.row];
       const outcomes = [];
       for (const sequence of sequences) {
+        if (outcomes.length >= 7 && performance.now() >= deadline) break;
         const raw = rolloutSequencePolicyRaw(
           pickedRows,
           action.ceiling.occupiedMask,
@@ -2461,11 +2501,14 @@
       action.forecastLow = roundOne(
         outcomes[Math.floor((outcomes.length - 1) * 0.25)],
       );
+      forecasted.push(action);
     }
     if (workSinceYield) await yieldToBrowser(shouldContinue);
-    evaluation.best = [...shortlist.values()].reduce((winner, action) =>
-      compareForecastActions(action, winner) > 0 ? action : winner,
-    null);
+    if (forecasted.length) {
+      evaluation.best = forecasted.reduce((winner, action) =>
+        compareForecastActions(action, winner) > 0 ? action : winner,
+      null);
+    }
     evaluation.forecastSamples = sequences.length;
     return evaluation;
   }
@@ -2833,6 +2876,7 @@
     cell,
     entries,
     remainingRetryCount = 0,
+    deadline = Number.POSITIVE_INFINITY,
     shouldContinue = () => true,
   ) {
     if (
@@ -2899,7 +2943,10 @@
       };
     }
 
-    const cells = retryCells(scope, cell, entries);
+    const cells = shuffled(
+      retryCells(scope, cell, entries),
+      new MulberryRng(hashText(`retry-cells:${scope}:${cell.team}|${cell.era}`)),
+    );
     const outcomes = [];
     let legalCount = 0;
     let totalRaw = 0;
@@ -2910,6 +2957,7 @@
     let ceilingPathCount = 0;
     const limits = rolloutLimits();
     for (const alternative of cells) {
+      if (outcomes.length && performance.now() >= deadline) break;
       pathTrials += limits.retrySamples;
       await yieldToBrowser(shouldContinue);
       const result = await forecastEvaluation(
@@ -2920,6 +2968,7 @@
           maxActions: limits.retryActions,
           seed: `retry:${scope}:${cell.team}|${cell.era}:${alternative.team}|${alternative.era}`,
           retryCount: remainingRetryCount,
+          deadline,
           shouldContinue,
         },
       );
@@ -2941,8 +2990,9 @@
         Number(result.best.ceiling.possible82);
       outcomes.push({ cell: alternative, action: result.best });
     }
-    if (!cells.length) return null;
-    const meanRaw = totalRaw / cells.length;
+    if (!outcomes.length) return null;
+    const evaluatedCount = outcomes.length;
+    const meanRaw = totalRaw / evaluatedCount;
     const best = outcomes.reduce((winner, outcome) => {
       const action = outcome.action;
       return action && (!winner || compareForecastActions(action, winner) > 0)
@@ -2952,18 +3002,19 @@
     return {
       scope,
       outcomes,
-      count: cells.length,
+      count: evaluatedCount,
+      populationCount: cells.length,
       legalCount,
-      legalRate: legalCount / cells.length,
+      legalRate: legalCount / evaluatedCount,
       meanRaw,
       meanScore: roundOne(meanRaw),
-      meanWins: totalWins / cells.length,
+      meanWins: totalWins / evaluatedCount,
       pathRate: pathTrials ? pathHits / pathTrials : 0,
       pathHits,
       pathTrials,
-      ceilingPathRate: ceilingPathCount / cells.length,
+      ceilingPathRate: ceilingPathCount / evaluatedCount,
       best,
-      decisionRaw: totalDecisionRaw / cells.length,
+      decisionRaw: totalDecisionRaw / evaluatedCount,
     };
   }
 
@@ -3898,6 +3949,11 @@
             if (!stillCurrent()) return;
             try {
               const limits = rolloutLimits();
+              const currentDeadline =
+                performance.now() +
+                (runtime.mode === "1v1"
+                  ? ONE_V_ONE_ANALYSIS_MAX_MS
+                  : CURRENT_ANALYSIS_MAX_MS);
               const current = await forecastEvaluation(
                 evaluateCell(cell, entries, true),
                 entries,
@@ -3911,6 +3967,7 @@
                   retryCount:
                     Number(retries.team.available) +
                     Number(retries.era.available),
+                  deadline: currentDeadline,
                   shouldContinue: stillCurrent,
                 },
               );
@@ -3920,6 +3977,10 @@
                     cell,
                     entries,
                     Number(retries.era.available),
+                    performance.now() +
+                      (runtime.mode === "1v1"
+                        ? ONE_V_ONE_ANALYSIS_MAX_MS / 2
+                        : RETRY_ANALYSIS_MAX_MS),
                     stillCurrent,
                   )
                 : null;
@@ -3929,6 +3990,10 @@
                     cell,
                     entries,
                     Number(retries.team.available),
+                    performance.now() +
+                      (runtime.mode === "1v1"
+                        ? ONE_V_ONE_ANALYSIS_MAX_MS / 2
+                        : RETRY_ANALYSIS_MAX_MS),
                     stillCurrent,
                   )
                 : null;

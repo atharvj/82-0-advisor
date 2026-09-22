@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
+  POSITIONS,
   TARGET_SCORE,
   normalizeDataset,
   calculateTeamResult,
@@ -11,6 +12,7 @@ const {
   meaningfulRateAdvantage,
   bestRolloutSequenceRaw,
   stratifiedFutureKeys,
+  rolloutCandidateShortlist,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -96,6 +98,31 @@ for (let round = 0; round < 3; round += 1) {
       "team sampling must rotate within each represented era",
     );
   }
+}
+
+const shortlistData = normalizeDataset(
+  POSITIONS.flatMap((position, positionIndex) =>
+    Array.from({ length: 5 }, (_, index) =>
+      row(
+        `${position}-${index}`,
+        "TST",
+        "2020s",
+        [position],
+        10 + positionIndex + index,
+        2,
+        2,
+        0,
+        0,
+      ),
+    ),
+  ),
+);
+const shortlist = rolloutCandidateShortlist([], 0, shortlistData.rows);
+for (const position of POSITIONS) {
+  assert.ok(
+    shortlist.some((candidate) => candidate.row.positions.includes(position)),
+    `bounded rollout finalists must preserve a candidate for ${position}`,
+  );
 }
 
 const knownMaximum = [
