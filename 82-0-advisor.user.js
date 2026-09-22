@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      1.8.0
+// @version      1.9.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.8.0";
+  const VERSION = "1.9.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -51,7 +51,8 @@
   const ROLLOUT_CURRENT_ACTIONS = 24;
   const ROLLOUT_RETRY_ACTIONS = 10;
   const ROLLOUT_ROWS_PER_POSITION = 3;
-  const ANALYSIS_YIELD_EVERY = 6;
+  const ANALYSIS_SLICE_MS = 8;
+  const ANALYSIS_NODE_CHECK_EVERY = 32;
 
   // These are algebraically identical to the current production team formula.
   const COEFF_PPG = (100 * 0.46) / 133.4;
@@ -215,6 +216,60 @@
     };
 
     visit(0, occupied);
+    return Number.isFinite(bestRaw) ? bestRaw : null;
+  }
+
+  async function bestRolloutSequenceRawCooperative(
+    fixedRows,
+    occupied,
+    futurePools,
+    budget,
+    rowsPerPosition = ROLLOUT_ROWS_PER_POSITION,
+  ) {
+    if (!futurePools.length) return rawTeamScore(fixedRows);
+    const usedNames = new Set(fixedRows.map((row) => row.player));
+    const picked = [...fixedRows];
+    let bestRaw = Number.NEGATIVE_INFINITY;
+    let visitedNodes = 0;
+
+    const visit = async (round, mask) => {
+      visitedNodes += 1;
+      if (visitedNodes % ANALYSIS_NODE_CHECK_EVERY === 0) {
+        await yieldIfNeeded(budget);
+      }
+      if (round === futurePools.length) {
+        bestRaw = Math.max(bestRaw, rawTeamScore(picked));
+        return;
+      }
+      const pool = futurePools[round] || [];
+      const candidates = [];
+      const seen = new Set();
+      for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+        const bit = 1 << positionIndex;
+        if (mask & bit) continue;
+        const strongest = pool
+          .filter(
+            (row) => row.posMask & bit && !usedNames.has(row.player),
+          )
+          .sort((left, right) => rolloutRowValue(right) - rolloutRowValue(left))
+          .slice(0, rowsPerPosition);
+        for (const row of strongest) {
+          const key = `${row.key}@${positionIndex}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push({ row, bit });
+        }
+      }
+      for (const candidate of candidates) {
+        usedNames.add(candidate.row.player);
+        picked.push(candidate.row);
+        await visit(round + 1, mask | candidate.bit);
+        picked.pop();
+        usedNames.delete(candidate.row.player);
+      }
+    };
+
+    await visit(0, occupied);
     return Number.isFinite(bestRaw) ? bestRaw : null;
   }
 
@@ -1222,8 +1277,6 @@
         box-shadow: 0 0 18px rgba(56,189,248,.72) !important;
       }
       [data-82coach-retry="team"] {
-        --82coach-retry-color: #f59e0b;
-        --82coach-retry-text: #241300;
         position: relative !important;
         z-index: 25 !important;
         box-sizing: border-box !important;
@@ -1232,11 +1285,8 @@
         outline: 5px solid #f59e0b !important;
         outline-offset: 3px !important;
         box-shadow: inset 0 0 0 3px #f59e0b, 0 0 0 9px rgba(245,158,11,.3), 0 0 34px 12px rgba(245,158,11,.9) !important;
-        animation: __82coachPulse 1.1s ease-in-out infinite alternate;
       }
       [data-82coach-retry="era"] {
-        --82coach-retry-color: #a855f7;
-        --82coach-retry-text: #180523;
         position: relative !important;
         z-index: 25 !important;
         box-sizing: border-box !important;
@@ -1245,30 +1295,7 @@
         outline: 5px solid #a855f7 !important;
         outline-offset: 3px !important;
         box-shadow: inset 0 0 0 3px #a855f7, 0 0 0 9px rgba(168,85,247,.32), 0 0 34px 12px rgba(168,85,247,.9) !important;
-        animation: __82coachPulse 1.1s ease-in-out infinite alternate;
       }
-      [data-82coach-retry]::after {
-        content: attr(data-82coach-retry-label) !important;
-        position: absolute !important;
-        inset: -4px !important;
-        z-index: 2147483646 !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        padding: 3px 8px !important;
-        border: 3px solid #fff !important;
-        border-radius: 999px !important;
-        background: var(--82coach-retry-color) !important;
-        color: var(--82coach-retry-text) !important;
-        font: 950 14px/1.05 system-ui, sans-serif !important;
-        letter-spacing: .035em !important;
-        text-align: center !important;
-        text-transform: uppercase !important;
-        white-space: nowrap !important;
-        pointer-events: none !important;
-      }
-      [data-82coach-retry-muted="true"] { opacity:.34 !important; filter:grayscale(.8) brightness(.65) !important; }
-      @keyframes __82coachPulse { from { filter:brightness(1.08); } to { filter:brightness(1.48); } }
     `;
     document.head.appendChild(style);
   }
@@ -1730,7 +1757,7 @@
   }
 
   function renderAnalyzing() {
-    renderLoading("Analyzing in the background… you can keep playing.");
+    renderLoading("Analyzing the roll");
   }
 
   async function loadRows() {
@@ -2028,7 +2055,12 @@
     );
   }
 
-  function evaluateCell(cell, entries, withPlans = true) {
+  async function evaluateCell(
+    cell,
+    entries,
+    withPlans = true,
+    budget,
+  ) {
     const fixedRows = entries.map((entry) => entry.row);
     const usedNames = new Set(fixedRows.map((row) => row.player));
     const states = reachableRosterStates(entries);
@@ -2037,6 +2069,10 @@
     const actions = [];
 
     for (const row of rows) {
+      // relaxedCeiling is the largest indivisible unit in this pass. Check the
+      // time budget before every player so input, scrolling, and animations
+      // run between short slices instead of waiting for the whole pool.
+      await yieldIfNeeded(budget);
       if (usedNames.has(row.player)) continue;
       let ceiling = runtime.optimizer.relaxedCeiling(
         [...fixedRows, row],
@@ -2131,10 +2167,22 @@
     if (!shouldContinue()) throw analysisCancelledError();
   }
 
+  function createAnalysisBudget(shouldContinue) {
+    return { shouldContinue, sliceStarted: performance.now() };
+  }
+
+  async function yieldIfNeeded(budget, force = false) {
+    if (!budget?.shouldContinue?.()) throw analysisCancelledError();
+    if (!force && performance.now() - budget.sliceStarted < ANALYSIS_SLICE_MS)
+      return;
+    await yieldToBrowser(budget.shouldContinue);
+    budget.sliceStarted = performance.now();
+  }
+
   async function forecastEvaluation(
     evaluation,
     entries,
-    { samples, maxActions, seed, shouldContinue = () => true },
+    { samples, maxActions, seed, budget },
   ) {
     if (!evaluation?.actions?.length) return evaluation;
     const fixedRows = entries.map((entry) => entry.row);
@@ -2163,22 +2211,18 @@
       samples,
       `${seed}|${fixedRows.map((row) => row.key).sort().join(";")}`,
     );
-    let workSinceYield = 0;
     for (const action of shortlist.values()) {
       const pickedRows = [...fixedRows, action.row];
       const outcomes = [];
       for (const sequence of sequences) {
-        const raw = bestRolloutSequenceRaw(
+        const raw = await bestRolloutSequenceRawCooperative(
           pickedRows,
           action.ceiling.occupiedMask,
           sequence,
+          budget,
         );
         if (raw !== null) outcomes.push(raw);
-        workSinceYield += 1;
-        if (workSinceYield >= ANALYSIS_YIELD_EVERY) {
-          workSinceYield = 0;
-          await yieldToBrowser(shouldContinue);
-        }
+        await yieldIfNeeded(budget);
       }
       if (!outcomes.length) continue;
       outcomes.sort((left, right) => left - right);
@@ -2197,7 +2241,7 @@
         outcomes[Math.floor((outcomes.length - 1) * 0.25)],
       );
     }
-    if (workSinceYield) await yieldToBrowser(shouldContinue);
+    await yieldIfNeeded(budget);
     evaluation.best = [...shortlist.values()].reduce((winner, action) =>
       compareForecastActions(action, winner) > 0 ? action : winner,
     null);
@@ -2567,7 +2611,7 @@
     scope,
     cell,
     entries,
-    shouldContinue = () => true,
+    budget,
   ) {
     if (
       runtime.shadowReady &&
@@ -2578,7 +2622,12 @@
       const predicted = shadow.respin(scope);
       if (!predicted) return null;
       const predictedCell = { team: predicted.team, era: predicted.era };
-      const result = evaluateCell(predictedCell, entries, false);
+      const result = await evaluateCell(
+        predictedCell,
+        entries,
+        false,
+        budget,
+      );
       const action = result.best;
       const otherScope = scope === "team" ? "era" : "team";
       let chain = null;
@@ -2587,7 +2636,14 @@
         const chainedDraw = chainedShadow.respin(otherScope);
         if (chainedDraw) {
           const chainedCell = { team: chainedDraw.team, era: chainedDraw.era };
-          const chainedAction = evaluateCell(chainedCell, entries, false).best;
+          const chainedAction = (
+            await evaluateCell(
+              chainedCell,
+              entries,
+              false,
+              budget,
+            )
+          ).best;
           chain = {
             scope: otherScope,
             cell: chainedCell,
@@ -2635,15 +2691,15 @@
     let pathCount = 0;
     let ceilingPathCount = 0;
     for (const alternative of cells) {
-      await yieldToBrowser(shouldContinue);
+      await yieldIfNeeded(budget);
       const result = await forecastEvaluation(
-        evaluateCell(alternative, entries, false),
+        await evaluateCell(alternative, entries, false, budget),
         entries,
         {
           samples: ROLLOUT_RETRY_SAMPLES,
           maxActions: ROLLOUT_RETRY_ACTIONS,
           seed: `retry:${scope}:${cell.team}|${cell.era}:${alternative.team}|${alternative.era}`,
-          shouldContinue,
+          budget,
         },
       );
       if (!result.best) {
@@ -2897,15 +2953,6 @@
     if (isRetry) {
       const retryElement = retries[advice.kind]?.element;
       retryElement?.setAttribute("data-82coach-retry", advice.kind);
-      retryElement?.setAttribute(
-        "data-82coach-retry-label",
-        `↻ Reroll ${advice.kind} now`,
-      );
-      const otherKind = advice.kind === "team" ? "era" : "team";
-      retries[otherKind]?.element?.setAttribute(
-        "data-82coach-retry-muted",
-        "true",
-      );
     }
 
     if (move) {
@@ -3579,12 +3626,13 @@
           runtime.analysisInProgressKey === analysisKey &&
           runtime.analysisGeneration === analysisGeneration &&
           readUiState().enabled;
+        const budget = createAnalysisBudget(stillCurrent);
         requestAnimationFrame(() => {
           window.setTimeout(async () => {
             if (!stillCurrent()) return;
             try {
               const current = await forecastEvaluation(
-                evaluateCell(cell, entries),
+                await evaluateCell(cell, entries, true, budget),
                 entries,
                 {
                   samples: ROLLOUT_CURRENT_SAMPLES,
@@ -3593,16 +3641,16 @@
                     .map((entry) => entry.row.key)
                     .sort()
                     .join(";")}`,
-                  shouldContinue: stillCurrent,
+                  budget,
                 },
               );
               const teamRetry = retries.team.available
-                ? await summarizeRetry("team", cell, entries, stillCurrent)
+                ? await summarizeRetry("team", cell, entries, budget)
                 : null;
               const eraRetry = retries.era.available
-                ? await summarizeRetry("era", cell, entries, stillCurrent)
+                ? await summarizeRetry("era", cell, entries, budget)
                 : null;
-              await yieldToBrowser(stillCurrent);
+              await yieldIfNeeded(budget, true);
               const completed = {
                 current,
                 teamRetry,
