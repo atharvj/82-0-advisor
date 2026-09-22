@@ -14,6 +14,8 @@ The coach is advisory only: it highlights recommendations without blocking any p
 
 Forecasting yields to the browser in small batches, so the site stays interactive while the coach analyzes. If Team or Era retry is the recommendation, the retry button gets a prominent **REROLL ... NOW** label and the fallback player is not highlighted.
 
+Forecast records are expected values used for planning. Because 82-0's server can vary the final simulated record, the coach reads and displays the official server result on the final screen.
+
 ## Guide
 
 - Green: pick this player

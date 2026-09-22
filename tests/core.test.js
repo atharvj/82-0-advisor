@@ -32,7 +32,12 @@ assert.equal(
 assert.equal(
   projectedWins(91.3),
   62,
-  "record projection must match the current production server",
+  "record projection must match the planning expectation curve",
+);
+assert.equal(
+  projectedWins(98),
+  68,
+  "planning uses an expected record; final server simulations may vary",
 );
 
 const knownMaximum = [

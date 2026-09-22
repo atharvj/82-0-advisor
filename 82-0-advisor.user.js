@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      1.7.0
+// @version      1.8.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.7.0";
+  const VERSION = "1.8.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -40,8 +40,9 @@
     "2020s",
   ]);
   // The live server maps a displayed team score to wins as
-  // round(82 * (score / 116)^1.15), capped at 82. Since team scores are
-  // displayed to one decimal, 115.4 is the first score that rounds to 82 wins.
+  // Expected record curve used for planning. The production server can vary
+  // the final simulated record, so the result screen always prefers its
+  // authoritative score_display payload over this expectation.
   const RECORD_SCORE_CAP = 116;
   const TARGET_SCORE = 115.4;
   const EPSILON = 1e-10;
@@ -1001,14 +1002,22 @@
           /\/game-session\/api\/v3\/session\/spin(?:$|[?#])/i.test(
             response.url,
           );
-        if (!isSeededStart && !isDealtStart && !isDealtSpin) return;
+        let isVaultyApi = false;
+        try {
+          isVaultyApi =
+            new URL(response.url).hostname === "api.vaultystudios.com";
+        } catch (_) {}
+        if (!isSeededStart && !isDealtStart && !isDealtSpin && !isVaultyApi)
+          return;
         response
           .clone()
           .json()
           .then((payload) => {
+            captureOfficialResult(payload);
             if (isDealtSpin) captureDealtSpin(payload);
             else if (isDealtStart) captureDealtSession(payload);
-            else captureStudioSession(payload, observedDatasetUrl);
+            else if (isSeededStart)
+              captureStudioSession(payload, observedDatasetUrl);
           })
           .catch(() => {});
       })
@@ -1073,6 +1082,7 @@
     scanSerial: 0,
     idleRecoveryScans: 0,
     resultMismatchCandidate: null,
+    officialResult: null,
     modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
     mode: safeSessionGet(MODE_KEY) || "classic",
   };
@@ -1095,6 +1105,33 @@
     try {
       sessionStorage.removeItem(key);
     } catch (_) {}
+  }
+
+  function captureOfficialResult(payload) {
+    const roots = [payload, payload?.result, payload?.data].filter(Boolean);
+    for (const root of roots) {
+      const display = root?.score_display;
+      if (!display || typeof display !== "object") continue;
+      const values = display.values || display.detail || display;
+      const wins = Number(values?.wins);
+      const losses = Number(values?.losses);
+      if (
+        !Number.isInteger(wins) ||
+        !Number.isInteger(losses) ||
+        wins < 0 ||
+        losses < 0 ||
+        wins + losses !== 82
+      )
+        continue;
+      const score = Number(root?.score);
+      runtime.officialResult = {
+        wins,
+        losses,
+        score: Number.isFinite(score) ? score : null,
+      };
+      if (document.body) scheduleScan(0);
+      return;
+    }
   }
 
   function escapeHtml(value) {
@@ -3167,26 +3204,73 @@
     );
   }
 
+  function officialRecordFromPage() {
+    const labels = [...document.querySelectorAll("span,p,div")].filter(
+      (element) =>
+        isVisible(element) &&
+        /^projected record$/i.test(directText(element)),
+    );
+    for (const label of labels) {
+      let container = label.parentElement;
+      for (let depth = 0; container && depth < 6; depth += 1) {
+        const text = (container.innerText || container.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        for (const match of text.matchAll(/\b(\d{1,2})\s*[-–—]\s*(\d{1,2})\b/g)) {
+          const wins = Number(match[1]);
+          const losses = Number(match[2]);
+          if (wins + losses === 82) return { wins, losses, score: null };
+        }
+        container = container.parentElement;
+      }
+    }
+    return null;
+  }
+
+  function officialScoreFromPage() {
+    for (const element of document.querySelectorAll("span,p")) {
+      if (!isVisible(element)) continue;
+      const match = directText(element).match(/^([\d,.]+)\s*pts$/i);
+      if (!match) continue;
+      const score = Number(match[1].replaceAll(",", ""));
+      if (Number.isFinite(score) && score >= 0 && score <= 200) return score;
+    }
+    return null;
+  }
+
   function renderResultsIfPresent() {
     const resultButton = findResultButton();
     if (!resultButton) return false;
     clearHighlights();
     const rows = [...runtime.tracked.values()].map((tracked) => tracked.row);
-    if (rows.length !== 5) {
+    const calculated = rows.length === 5 ? calculateTeamResult(rows) : null;
+    const official = runtime.officialResult || officialRecordFromPage();
+    if (!calculated && !official) {
       renderPanel(
-        '<div class="loading">Final screen detected. The coach missed a pick; start the next game and it will resync automatically.</div>',
+        '<div class="loading">Final screen detected. Waiting for the official result…</div>',
         `result-missing:${rows.length}`,
       );
       return true;
     }
-    const result = calculateTeamResult(rows);
-    const color = result.possible82 ? COLORS.pick : COLORS.impossible;
+    const displayed = official || calculated;
+    const officialScore = runtime.officialResult?.score;
+    const pageScore = officialScoreFromPage();
+    const score = Number.isFinite(officialScore)
+      ? officialScore
+      : calculated?.score ?? pageScore;
+    const possible82 = displayed.wins === 82;
+    const color = possible82 ? COLORS.pick : COLORS.impossible;
+    const sourceLine = official
+      ? calculated
+        ? "Official server record · score independently recomputed from all five peaks."
+        : "Official server result."
+      : "Record projected with the current 82-0 curve; score exactly recomputed from all five peaks.";
     renderPanel(
-      `<div class="status" style="--status:${color}"><span class="dot"></span><span>${result.possible82 ? "82-0 achieved" : "Final team"}</span></div>
-       <div class="action" style="--action:${color}"><div class="eyebrow">FINAL RESULT</div><div class="primary"><span class="name">${result.wins}-${result.losses}</span><span class="arrow">·</span><span class="position">${result.score.toFixed(1)}</span></div><div class="sub">Exact recomputation from all five selected peaks.</div></div>`,
-      `result:${result.score}:${result.wins}:${runtime.mode}`,
+      `<div class="status" style="--status:${color}"><span class="dot"></span><span>${possible82 ? "82-0 achieved" : "Final team"}</span></div>
+       <div class="action" style="--action:${color}"><div class="eyebrow">FINAL RESULT</div><div class="primary"><span class="name">${displayed.wins}-${displayed.losses}</span><span class="arrow">·</span><span class="position">${Number.isFinite(score) ? score.toFixed(1) : "—"}</span></div><div class="sub">${sourceLine}</div></div>`,
+      `result:${score}:${displayed.wins}:${runtime.mode}:${official ? "official" : "projected"}`,
     );
-    checkModelDrift(result);
+    if (calculated) checkModelDrift(calculated);
     return true;
   }
 
@@ -3256,6 +3340,7 @@
     runtime.pickOrder = 0;
     runtime.emptyTraySince = 0;
     runtime.idleRecoveryScans = 0;
+    runtime.officialResult = null;
     runtime.sessionPayload = null;
     runtime.dealtSessionId = null;
     runtime.dealtCell = null;
