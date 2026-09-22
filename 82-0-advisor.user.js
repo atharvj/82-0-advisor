@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.0.0
+// @version      2.1.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.0.0";
+  const VERSION = "2.1.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
   const SITE_STYLE_ID = "__82coach_site_style__";
@@ -23,6 +23,8 @@
   const MODE_KEY = "__82coach_mode_v1__";
   const MISMATCH_KEY = "__82coach_model_mismatch_v1__";
   const PICKS_KEY = "__82coach_picks_v1__";
+  const HISTORY_KEY = "__82coach_results_v1__";
+  const HISTORY_LIMIT = 100;
   const PICKS_MAX_AGE = 6 * 60 * 60 * 1000;
   const PENDING_PICK_MAX_AGE = 30_000;
   const MAX_IDLE_RECOVERY_SCANS = 8;
@@ -45,16 +47,18 @@
   const RECORD_SCORE_CAP = 110;
   const TARGET_SCORE = 109.5;
   const EPSILON = 1e-10;
-  const ROLLOUT_CURRENT_SAMPLES = 32;
-  const ROLLOUT_RETRY_SAMPLES = 8;
-  const ROLLOUT_CURRENT_ACTIONS = 28;
-  const ROLLOUT_RETRY_ACTIONS = 12;
+  const ROLLOUT_CURRENT_SAMPLES = 42;
+  const ROLLOUT_RETRY_SAMPLES = 7;
+  const ROLLOUT_CURRENT_ACTIONS = 48;
+  const ROLLOUT_RETRY_ACTIONS = 2;
   const ROLLOUT_ROWS_PER_POSITION = 3;
-  const ONE_V_ONE_CURRENT_SAMPLES = 6;
-  const ONE_V_ONE_RETRY_SAMPLES = 2;
-  const ONE_V_ONE_CURRENT_ACTIONS = 10;
-  const ONE_V_ONE_RETRY_ACTIONS = 5;
+  const ONE_V_ONE_CURRENT_SAMPLES = 7;
+  const ONE_V_ONE_RETRY_SAMPLES = 7;
+  const ONE_V_ONE_CURRENT_ACTIONS = 12;
+  const ONE_V_ONE_RETRY_ACTIONS = 1;
   const ANALYSIS_YIELD_EVERY = 6;
+  const PATH_CONFIDENCE_Z = 1.645;
+  const MIN_PATH_ADVANTAGE = 0.08;
 
   // These are algebraically identical to the current production team formula.
   const COEFF_PPG = (100 * 0.46) / 133.4;
@@ -157,6 +161,26 @@
     const score = roundOne(raw);
     const wins = projectedWins(score);
     return { raw, score, wins, losses: 82 - wins, possible82: wins === 82 };
+  }
+
+  function meaningfulRateAdvantage(
+    betterRate,
+    betterTrials,
+    worseRate,
+    worseTrials,
+  ) {
+    const difference = betterRate - worseRate;
+    if (difference <= 0) return false;
+    const leftTrials = Math.max(1, finiteNumber(betterTrials));
+    const rightTrials = Math.max(1, finiteNumber(worseTrials));
+    const standardError = Math.sqrt(
+      (betterRate * (1 - betterRate)) / leftTrials +
+        (worseRate * (1 - worseRate)) / rightTrials,
+    );
+    return (
+      difference >=
+      Math.max(MIN_PATH_ADVANTAGE, PATH_CONFIDENCE_Z * standardError)
+    );
   }
 
   function rolloutRowValue(row) {
@@ -1009,7 +1033,9 @@
     calculateTeamResult,
     projectedWins,
     rawTeamScore,
+    meaningfulRateAdvantage,
     bestRolloutSequenceRaw,
+    stratifiedFutureKeys,
     roundOne,
     positionMask,
     reachableRosterStates,
@@ -1152,6 +1178,7 @@
     idleRecoveryScans: 0,
     resultMismatchCandidate: null,
     officialResult: null,
+    resultRecorded: false,
     modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
     mode: safeSessionGet(MODE_KEY) || "classic",
   };
@@ -1235,6 +1262,66 @@
     try {
       localStorage.setItem(UI_KEY, JSON.stringify(next));
     } catch (_) {}
+  }
+
+  function readResultHistory() {
+    try {
+      const value = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+      return Array.isArray(value) ? value : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function writeResultHistory(history) {
+    try {
+      localStorage.setItem(
+        HISTORY_KEY,
+        JSON.stringify(history.slice(-HISTORY_LIMIT)),
+      );
+    } catch (_) {}
+  }
+
+  function recordCompletedGame(result, score) {
+    if (runtime.resultRecorded || !result) return readResultHistory();
+    const sessionId =
+      runtime.dealtSessionId || runtime.sessionPayload?.session_id || null;
+    const pickSignature = [...runtime.tracked.values()]
+      .map((tracked) => tracked.row.key)
+      .sort()
+      .join(";");
+    const id =
+      sessionId ||
+      `${runtime.mode}:${result.wins}:${Number.isFinite(score) ? score : "-"}:${hashText(pickSignature)}`;
+    const history = readResultHistory();
+    if (!history.some((entry) => entry.id === id)) {
+      history.push({
+        id,
+        at: Date.now(),
+        version: VERSION,
+        mode: runtime.mode,
+        wins: result.wins,
+        score: Number.isFinite(score) ? score : null,
+      });
+      writeResultHistory(history);
+    }
+    runtime.resultRecorded = true;
+    return history.slice(-HISTORY_LIMIT);
+  }
+
+  function resultHistorySummary(history) {
+    const comparable = history.filter(
+      (entry) =>
+        entry.version === VERSION &&
+        entry.mode === runtime.mode &&
+        Number.isFinite(entry.wins),
+    );
+    if (!comparable.length) return "";
+    const average =
+      comparable.reduce((sum, entry) => sum + entry.wins, 0) /
+      comparable.length;
+    const best = Math.max(...comparable.map((entry) => entry.wins));
+    return `Local ${modeLabel()} v${VERSION}: ${comparable.length} game${comparable.length === 1 ? "" : "s"} · ${average.toFixed(1)} average wins · ${best} best`;
   }
 
   function directText(element) {
@@ -2117,27 +2204,112 @@
     return hash >>> 0;
   }
 
-  function sampledFuturePools(rounds, sampleCount, seedText) {
-    if (rounds <= 0) return [[]];
+  function shuffled(values, rng) {
+    const copy = [...values];
+    for (let index = copy.length - 1; index > 0; index -= 1) {
+      const swapIndex = Math.floor(rng.next() * (index + 1));
+      [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+    }
+    return copy;
+  }
+
+  function stratifiedFutureKeys(keys, rounds, sampleCount, seedText) {
     const keysByEra = new Map();
-    for (const key of [...runtime.byCell.keys()].sort()) {
+    for (const key of [...keys].sort()) {
       const era = key.split("|")[1];
       if (!keysByEra.has(era)) keysByEra.set(era, []);
       keysByEra.get(era).push(key);
     }
     const eras = [...keysByEra.keys()].sort();
-    if (!eras.length) return [];
+    if (!eras.length || rounds <= 0 || sampleCount <= 0) return [];
     const rng = new MulberryRng(hashText(seedText));
-    return Array.from({ length: sampleCount }, () =>
-      Array.from({ length: rounds }, () => {
-        // The slot machine draws an era first, then a valid team in that era.
-        // Sampling cells uniformly badly underweights rare 1960s/1970s teams.
-        const era = eras[Math.floor(rng.next() * eras.length)];
-        const eraKeys = keysByEra.get(era);
-        const key = eraKeys[Math.floor(rng.next() * eraKeys.length)];
-        return runtime.byCell.get(key) || [];
-      }),
+    const scenarios = Array.from({ length: sampleCount }, () => []);
+
+    for (let round = 0; round < rounds; round += 1) {
+      const eraOrder = shuffled(eras, rng);
+      const teamOrders = new Map(
+        eras.map((era) => [era, shuffled(keysByEra.get(era), rng)]),
+      );
+      const eraVisits = new Map(eras.map((era) => [era, 0]));
+      const teamOffsets = new Map(
+        eras.map((era) => [
+          era,
+          Math.floor(rng.next() * teamOrders.get(era).length),
+        ]),
+      );
+      const eraOffset = Math.floor(rng.next() * eras.length);
+      for (let sample = 0; sample < sampleCount; sample += 1) {
+        const era = eraOrder[(sample + eraOffset) % eraOrder.length];
+        const teams = teamOrders.get(era);
+        const visit = eraVisits.get(era);
+        scenarios[sample].push(
+          teams[(visit + teamOffsets.get(era)) % teams.length],
+        );
+        eraVisits.set(era, visit + 1);
+      }
+    }
+    return scenarios;
+  }
+
+  function sampledFuturePools(rounds, sampleCount, seedText) {
+    if (rounds <= 0) return [[]];
+    return stratifiedFutureKeys(
+      runtime.byCell.keys(),
+      rounds,
+      sampleCount,
+      seedText,
+    ).map((scenario) =>
+      scenario.map((key) => runtime.byCell.get(key) || []),
     );
+  }
+
+  function rolloutSequencePolicyRaw(fixedRows, occupied, futurePools) {
+    const picked = [...fixedRows];
+    const usedNames = new Set(picked.map((row) => row.player));
+    let mask = occupied;
+
+    for (const pool of futurePools) {
+      let best = null;
+      for (const row of pool || []) {
+        if (usedNames.has(row.player)) continue;
+        for (let positionIndex = 0; positionIndex < 5; positionIndex += 1) {
+          const bit = 1 << positionIndex;
+          if (mask & bit || !(row.posMask & bit)) continue;
+          const postMask = mask | bit;
+          const ceiling = runtime.optimizer.ceilingForMask(
+            [...picked, row],
+            postMask,
+            false,
+          );
+          if (!ceiling) continue;
+          const partialRaw = rawTeamScore([...picked, row]);
+          // Benchmarked on balanced draws from the current 10,621-row pool.
+          // Pure ceiling chasing averaged 65.3 wins; this 75/25 blend averaged
+          // 66.7 by valuing production now without ignoring slot flexibility.
+          const policyRaw = 0.75 * partialRaw + 0.25 * ceiling.raw;
+          const candidate = {
+            row,
+            bit,
+            ceilingRaw: ceiling.raw,
+            partialRaw,
+            policyRaw,
+          };
+          if (
+            !best ||
+            candidate.policyRaw > best.policyRaw + EPSILON ||
+            (Math.abs(candidate.policyRaw - best.policyRaw) <= EPSILON &&
+              candidate.partialRaw > best.partialRaw + EPSILON)
+          ) {
+            best = candidate;
+          }
+        }
+      }
+      if (!best) return null;
+      picked.push(best.row);
+      usedNames.add(best.row.player);
+      mask |= best.bit;
+    }
+    return rawTeamScore(picked);
   }
 
   function compareForecastActions(left, right) {
@@ -2146,13 +2318,39 @@
       left.forecastPathRate ?? Number(left.ceiling.possible82);
     const rightPath =
       right.forecastPathRate ?? Number(right.ceiling.possible82);
-    if (Math.abs(leftPath - rightPath) > EPSILON)
-      return leftPath > rightPath ? 1 : -1;
+    const leftTrials = left.forecastOutcomes ?? 1;
+    const rightTrials = right.forecastOutcomes ?? 1;
+    if (
+      meaningfulRateAdvantage(
+        leftPath,
+        leftTrials,
+        rightPath,
+        rightTrials,
+      )
+    )
+      return 1;
+    if (
+      meaningfulRateAdvantage(
+        rightPath,
+        rightTrials,
+        leftPath,
+        leftTrials,
+      )
+    )
+      return -1;
     const leftForecast = left.forecastRaw ?? left.ceiling.raw;
     const rightForecast = right.forecastRaw ?? right.ceiling.raw;
     if (Math.abs(leftForecast - rightForecast) > EPSILON)
       return leftForecast > rightForecast ? 1 : -1;
+    if (Math.abs(leftPath - rightPath) > EPSILON)
+      return leftPath > rightPath ? 1 : -1;
     return compareActions(left, right);
+  }
+
+  function retryReserveBonus(remainingRounds, retryCount) {
+    if (remainingRounds <= 0 || retryCount <= 0) return 0;
+    const firstRetry = 0.55 + 0.18 * remainingRounds;
+    return firstRetry * (retryCount === 1 ? 1 : 1.75);
   }
 
   function rolloutLimits() {
@@ -2190,7 +2388,13 @@
   async function forecastEvaluation(
     evaluation,
     entries,
-    { samples, maxActions, seed, shouldContinue = () => true },
+    {
+      samples,
+      maxActions,
+      seed,
+      retryCount = 0,
+      shouldContinue = () => true,
+    },
   ) {
     if (!evaluation?.actions?.length) return evaluation;
     const fixedRows = entries.map((entry) => entry.row);
@@ -2224,7 +2428,7 @@
       const pickedRows = [...fixedRows, action.row];
       const outcomes = [];
       for (const sequence of sequences) {
-        const raw = bestRolloutSequenceRaw(
+        const raw = rolloutSequencePolicyRaw(
           pickedRows,
           action.ceiling.occupiedMask,
           sequence,
@@ -2246,9 +2450,14 @@
           (sum, raw) => sum + projectedWins(roundOne(raw)),
           0,
         ) / outcomes.length;
+      action.forecastPathHits = outcomes.filter(
+        (raw) => projectedWins(roundOne(raw)) === 82,
+      ).length;
+      action.forecastOutcomes = outcomes.length;
       action.forecastPathRate =
-        outcomes.filter((raw) => projectedWins(roundOne(raw)) === 82).length /
-        outcomes.length;
+        action.forecastPathHits / action.forecastOutcomes;
+      action.forecastDecisionRaw =
+        action.forecastRaw + retryReserveBonus(remainingRounds, retryCount);
       action.forecastLow = roundOne(
         outcomes[Math.floor((outcomes.length - 1) * 0.25)],
       );
@@ -2623,6 +2832,7 @@
     scope,
     cell,
     entries,
+    remainingRetryCount = 0,
     shouldContinue = () => true,
   ) {
     if (
@@ -2677,6 +2887,8 @@
         meanRaw: action?.ceiling.raw || 0,
         meanScore: action?.ceiling.score || 0,
         pathRate: action?.ceiling.possible82 ? 1 : 0,
+        pathHits: action?.ceiling.possible82 ? 1 : 0,
+        pathTrials: 1,
         best: action || null,
         reachableLegal: Boolean(action || chain?.action),
         reachablePath: Boolean(
@@ -2691,11 +2903,14 @@
     const outcomes = [];
     let legalCount = 0;
     let totalRaw = 0;
+    let totalDecisionRaw = 0;
     let totalWins = 0;
-    let pathCount = 0;
+    let pathHits = 0;
+    let pathTrials = 0;
     let ceilingPathCount = 0;
     const limits = rolloutLimits();
     for (const alternative of cells) {
+      pathTrials += limits.retrySamples;
       await yieldToBrowser(shouldContinue);
       const result = await forecastEvaluation(
         evaluateCell(alternative, entries, false),
@@ -2704,6 +2919,7 @@
           samples: limits.retrySamples,
           maxActions: limits.retryActions,
           seed: `retry:${scope}:${cell.team}|${cell.era}:${alternative.team}|${alternative.era}`,
+          retryCount: remainingRetryCount,
           shouldContinue,
         },
       );
@@ -2715,9 +2931,13 @@
       if (result.actions.some((action) => action.ceiling.possible82))
         ceilingPathCount += 1;
       totalRaw += result.best.forecastRaw ?? result.best.ceiling.raw;
+      totalDecisionRaw +=
+        result.best.forecastDecisionRaw ??
+        result.best.forecastRaw ??
+        result.best.ceiling.raw;
       totalWins += result.best.forecastWins ?? result.best.ceiling.wins;
-      pathCount +=
-        result.best.forecastPathRate ??
+      pathHits +=
+        result.best.forecastPathHits ??
         Number(result.best.ceiling.possible82);
       outcomes.push({ cell: alternative, action: result.best });
     }
@@ -2738,9 +2958,12 @@
       meanRaw,
       meanScore: roundOne(meanRaw),
       meanWins: totalWins / cells.length,
-      pathRate: pathCount / cells.length,
+      pathRate: pathTrials ? pathHits / pathTrials : 0,
+      pathHits,
+      pathTrials,
       ceilingPathRate: ceilingPathCount / cells.length,
       best,
+      decisionRaw: totalDecisionRaw / cells.length,
     };
   }
 
@@ -2802,15 +3025,31 @@
     const retryValue = (retry) => retry?.decisionRaw ?? retry?.meanRaw ?? 0;
     const retryPath = (retry) =>
       retry?.reachablePath ? 1 : retry?.pathRate ?? 0;
+    const retryTrials = (retry) => retry?.pathTrials ?? 1;
     const availableRetries = [
       retries.team.available && teamRetry ? teamRetry : null,
       retries.era.available && eraRetry ? eraRetry : null,
     ].filter(retryLegal);
     const bestRetry = availableRetries.reduce((winner, retry) => {
       if (!winner) return retry;
-      if (Math.abs(retryPath(retry) - retryPath(winner)) > EPSILON) {
-        return retryPath(retry) > retryPath(winner) ? retry : winner;
-      }
+      if (
+        meaningfulRateAdvantage(
+          retryPath(retry),
+          retryTrials(retry),
+          retryPath(winner),
+          retryTrials(winner),
+        )
+      )
+        return retry;
+      if (
+        meaningfulRateAdvantage(
+          retryPath(winner),
+          retryTrials(winner),
+          retryPath(retry),
+          retryTrials(retry),
+        )
+      )
+        return winner;
       if (Math.abs(retryValue(retry) - retryValue(winner)) > EPSILON) {
         return retryValue(retry) > retryValue(winner) ? retry : winner;
       }
@@ -2827,14 +3066,20 @@
 
     if (!bestRetry)
       return { kind: "pick", reason: "This has the strongest expected finish." };
-    const slotsAfterPick = Math.max(0, openSlots - 1);
-    const saveMargin = slotsAfterPick === 0 ? 0 : 0.65 + 0.2 * slotsAfterPick;
-    const currentValue = current.best.forecastRaw ?? current.best.ceiling.raw;
+    const currentValue =
+      current.best.forecastDecisionRaw ??
+      current.best.forecastRaw ??
+      current.best.ceiling.raw;
     const currentPath =
       current.best.forecastPathRate ?? Number(current.best.ceiling.possible82);
-    const pathGain = retryPath(bestRetry) - currentPath;
     const expectedGain = retryValue(bestRetry) - currentValue;
-    if (pathGain > EPSILON) {
+    const pathGainIsMeaningful = meaningfulRateAdvantage(
+      retryPath(bestRetry),
+      retryTrials(bestRetry),
+      currentPath,
+      current.best.forecastOutcomes ?? 1,
+    );
+    if (pathGainIsMeaningful && expectedGain > -0.75) {
       return {
         kind: bestRetry.scope,
         reason: bestRetry.chainRecommended
@@ -2842,7 +3087,7 @@
           : `This retry gives the stronger sampled route to 82-0 (${Math.round(currentPath * 100)}% → ${Math.round(retryPath(bestRetry) * 100)}%).`,
       };
     }
-    if (expectedGain > saveMargin + EPSILON) {
+    if (expectedGain > 0.25 + EPSILON) {
       return {
         kind: bestRetry.scope,
         reason: bestRetry.chainRecommended
@@ -3206,7 +3451,7 @@
           <div class="row"><span>Team retry forecast</span><strong>${escapeHtml(teamForecast)}</strong></div>
           <div class="row"><span>Era retry forecast</span><strong>${escapeHtml(eraForecast)}</strong></div>
           <div class="row"><span>Reason</span><strong>${escapeHtml(advice.reason)}</strong></div>
-          <div class="row"><span>Model</span><strong>${advice.seededPlan ? "Exact seeded full draft" : runtime.shadowReady && runtime.shadowSynced ? "Exact seeded retries" : "Expected-value server rollouts"} · ${MODEL_VERIFIED}</strong></div>
+          <div class="row"><span>Model</span><strong>${advice.seededPlan ? "Exact seeded full draft" : runtime.shadowReady && runtime.shadowSynced ? "Exact seeded retries" : "Balanced adaptive rollouts"} · ${MODEL_VERIFIED}</strong></div>
           ${seededRoute}
           <div class="legend">
             <span class="swatch" style="--c:${COLORS.pick}">pick</span>
@@ -3330,9 +3575,12 @@
         ? "Final result from 82-0 · score checked from all five selected peaks."
         : "Final result shown by 82-0."
       : "Record projected with the current 82-0 curve; score exactly recomputed from all five peaks.";
+    const historySummary = official
+      ? resultHistorySummary(recordCompletedGame(displayed, score))
+      : "";
     renderPanel(
       `<div class="status" style="--status:${color}"><span class="dot"></span><span>${possible82 ? "82-0 achieved" : "Final team"}</span></div>
-       <div class="action" style="--action:${color}"><div class="eyebrow">FINAL RESULT</div><div class="primary"><span class="name">${displayed.wins}-${displayed.losses}</span><span class="arrow">·</span><span class="position">${Number.isFinite(score) ? score.toFixed(1) : "—"}</span></div><div class="sub">${sourceLine}</div></div>`,
+       <div class="action" style="--action:${color}"><div class="eyebrow">FINAL RESULT</div><div class="primary"><span class="name">${displayed.wins}-${displayed.losses}</span><span class="arrow">·</span><span class="position">${Number.isFinite(score) ? score.toFixed(1) : "—"}</span></div><div class="sub">${escapeHtml(sourceLine)}${historySummary ? `<br>${escapeHtml(historySummary)}` : ""}</div></div>`,
       `result:${score}:${displayed.wins}:${runtime.mode}:${official ? "official" : "projected"}`,
     );
     if (calculated) checkModelDrift(calculated);
@@ -3406,6 +3654,7 @@
     runtime.emptyTraySince = 0;
     runtime.idleRecoveryScans = 0;
     runtime.officialResult = null;
+    runtime.resultRecorded = false;
     runtime.sessionPayload = null;
     runtime.dealtSessionId = null;
     runtime.dealtCell = null;
@@ -3659,14 +3908,29 @@
                     .map((entry) => entry.row.key)
                     .sort()
                     .join(";")}`,
+                  retryCount:
+                    Number(retries.team.available) +
+                    Number(retries.era.available),
                   shouldContinue: stillCurrent,
                 },
               );
               const teamRetry = retries.team.available
-                ? await summarizeRetry("team", cell, entries, stillCurrent)
+                ? await summarizeRetry(
+                    "team",
+                    cell,
+                    entries,
+                    Number(retries.era.available),
+                    stillCurrent,
+                  )
                 : null;
               const eraRetry = retries.era.available
-                ? await summarizeRetry("era", cell, entries, stillCurrent)
+                ? await summarizeRetry(
+                    "era",
+                    cell,
+                    entries,
+                    Number(retries.team.available),
+                    stillCurrent,
+                  )
                 : null;
               await yieldToBrowser(stillCurrent);
               const completed = {

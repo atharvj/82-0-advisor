@@ -8,7 +8,9 @@ const {
   normalizeDataset,
   calculateTeamResult,
   projectedWins,
+  meaningfulRateAdvantage,
   bestRolloutSequenceRaw,
+  stratifiedFutureKeys,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -40,6 +42,61 @@ assert.equal(
   72,
   "planning curve must match the signed-in result shown by the site",
 );
+
+assert.equal(
+  meaningfulRateAdvantage(0.55, 100, 0.5, 100),
+  false,
+  "a small noisy path-rate difference must not override expected score",
+);
+assert.equal(
+  meaningfulRateAdvantage(0.75, 100, 0.5, 100),
+  true,
+  "a large statistically meaningful path advantage must be recognized",
+);
+
+const stratifiedKeys = [
+  "A|1960s",
+  "B|1960s",
+  "A|1970s",
+  "B|1970s",
+  "A|1980s",
+  "B|1980s",
+  "A|1990s",
+  "B|1990s",
+  "A|2000s",
+  "B|2000s",
+  "A|2010s",
+  "B|2010s",
+  "A|2020s",
+  "B|2020s",
+];
+const stratified = stratifiedFutureKeys(stratifiedKeys, 3, 14, "test");
+assert.equal(stratified.length, 14);
+for (let round = 0; round < 3; round += 1) {
+  const eraCounts = new Map();
+  for (const scenario of stratified) {
+    const era = scenario[round].split("|")[1];
+    eraCounts.set(era, (eraCounts.get(era) || 0) + 1);
+  }
+  assert.deepEqual(
+    [...eraCounts.values()].sort((left, right) => left - right),
+    [2, 2, 2, 2, 2, 2, 2],
+    "every forecast round must represent every era equally",
+  );
+  for (const era of eraCounts.keys()) {
+    const teams = new Set(
+      stratified
+        .map((scenario) => scenario[round])
+        .filter((key) => key.endsWith(`|${era}`))
+        .map((key) => key.split("|")[0]),
+    );
+    assert.equal(
+      teams.size,
+      2,
+      "team sampling must rotate within each represented era",
+    );
+  }
+}
 
 const knownMaximum = [
   row("Oscar Robertson", "SAC", "1960s", ["PG"], 29.66, 8.73, 10.5, null, null),
@@ -251,9 +308,10 @@ assert.equal(
 
 const livePath = process.env.DATASET || "/tmp/players_flat.json";
 if (fs.existsSync(livePath)) {
-  const liveData = normalizeDataset(
-    JSON.parse(fs.readFileSync(path.resolve(livePath), "utf8")),
+  const liveSource = JSON.parse(
+    fs.readFileSync(path.resolve(livePath), "utf8"),
   );
+  const liveData = normalizeDataset(liveSource.players || liveSource);
   const liveOptimizer = new ExactCeilingOptimizer(
     liveData.rows,
     liveData.names,
