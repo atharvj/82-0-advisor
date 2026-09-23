@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.3.0
+// @version      2.3.1
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.3.0";
+  const VERSION = "2.3.1";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -118,6 +118,26 @@
       };
     }
     return null;
+  }
+
+  function resolveSquadRows(squad, byId, byKey, cell) {
+    if (!Array.isArray(squad)) return [];
+    const rows = [];
+    const seen = new Set();
+    for (const player of squad) {
+      const id = player?.player_id ?? player?.id;
+      let row =
+        id !== undefined && id !== null ? byId.get(String(id)) : null;
+      if (!row && player?.name) {
+        const team = player.team || player.team_abbr || cell.team;
+        const era = player.era || cell.era;
+        row = byKey.get(`${player.name}|${team}|${era}`) || null;
+      }
+      if (!row || seen.has(row.key)) continue;
+      seen.add(row.key);
+      rows.push(row);
+    }
+    return rows;
   }
 
   function popcount(value) {
@@ -1069,6 +1089,7 @@
     roundOne,
     matchupResult,
     opponentFromSessionPayload,
+    resolveSquadRows,
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
@@ -1177,6 +1198,7 @@
     namesSet: new Set(),
     byCell: new Map(),
     byKey: new Map(),
+    byId: new Map(),
     rowsByName: new Map(),
     teams: new Set(),
     optimizer: null,
@@ -1211,6 +1233,8 @@
     resultMismatchCandidate: null,
     officialResult: null,
     oneVsOneOpponent: null,
+    opponentPlayerIds: new Set(),
+    currentVisibleRows: [],
     resultRecorded: false,
     modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
     mode: safeSessionGet(MODE_KEY) || "classic",
@@ -1612,6 +1636,7 @@
     if (runtime.dealtSessionId !== sessionId) resetRuntime(runtime.mode);
     runtime.dealtSessionId = sessionId;
     runtime.oneVsOneOpponent = opponent;
+    runtime.opponentPlayerIds = opponentPlayerIds(opponent?.roster);
     runtime.dealtCell = null;
     runtime.sessionPayload = null;
     runtime.shadowSession = null;
@@ -1641,6 +1666,7 @@
       seq: Number(cell.seq),
       team: String(cell.team),
       era: String(cell.era),
+      squad: cell.squad.map((player) => ({ ...player })),
       legal: Array.isArray(cell.legal) ? [...cell.legal] : [],
       boosters: cell.boosters || null,
     };
@@ -1648,6 +1674,7 @@
     runtime.lastAnalysis = null;
     runtime.analysisInProgressKey = "";
     runtime.analysisGeneration += 1;
+    runtime.currentVisibleRows = [];
     if (document.body) scheduleScan(0);
   }
 
@@ -1882,6 +1909,7 @@
 
     for (const row of runtime.rows) {
       runtime.byKey.set(row.key, row);
+      runtime.byId.set(String(row.id), row);
       const cell = `${row.team}|${row.era}`;
       if (!runtime.byCell.has(cell)) runtime.byCell.set(cell, []);
       runtime.byCell.get(cell).push(row);
@@ -2119,6 +2147,54 @@
     return entries;
   }
 
+  function opponentPlayerIds(roster) {
+    const ids = new Set();
+    const entries = Array.isArray(roster)
+      ? roster
+      : roster && typeof roster === "object"
+        ? Object.values(roster)
+        : [];
+    for (const entry of entries) {
+      if (!entry || entry.entity === "team") continue;
+      const id =
+        entry.player_id ||
+        entry.id ||
+        entry.player?.player_id ||
+        entry.player?.id;
+      if (id !== undefined && id !== null && String(id)) ids.add(String(id));
+    }
+    return ids;
+  }
+
+  function forecastRowsForKey(key) {
+    const rows = runtime.byCell.get(key) || [];
+    if (!runtime.opponentPlayerIds.size) return rows;
+    return rows.filter(
+      (row) => !runtime.opponentPlayerIds.has(String(row.id)),
+    );
+  }
+
+  function dealtSquadRows(cell) {
+    if (!runtime.dealtCell || !sameCell(runtime.dealtCell, cell)) return null;
+    const squad = runtime.dealtCell.squad;
+    if (!Array.isArray(squad)) return null;
+    const rows = resolveSquadRows(
+      squad,
+      runtime.byId,
+      runtime.byKey,
+      cell,
+    );
+    if (rows.length) return rows;
+    return runtime.currentVisibleRows.length
+      ? [...runtime.currentVisibleRows]
+      : [];
+  }
+
+  function currentRowsForCell(cell) {
+    const dealtRows = dealtSquadRows(cell);
+    return dealtRows ?? forecastRowsForKey(`${cell.team}|${cell.era}`);
+  }
+
   function occupiedMask(entries) {
     let mask = 0;
     for (const entry of entries) mask |= 1 << POSITION_INDEX[entry.position];
@@ -2150,7 +2226,7 @@
   function evaluateCell(cell, entries, withPlans = true) {
     const fixedRows = entries.map((entry) => entry.row);
     const usedNames = new Set(fixedRows.map((row) => row.player));
-    const rows = runtime.byCell.get(`${cell.team}|${cell.era}`) || [];
+    const rows = currentRowsForCell(cell);
     let best = null;
     const actions = [];
 
@@ -2241,7 +2317,7 @@
       sampleCount,
       seedText,
     ).map((scenario) =>
-      scenario.map((key) => runtime.byCell.get(key) || []),
+      scenario.map((key) => forecastRowsForKey(key)),
     );
   }
 
@@ -2859,8 +2935,7 @@
       if (scope === "team" && (era !== cell.era || team === cell.team))
         continue;
       if (scope === "era" && (team !== cell.team || era === cell.era)) continue;
-      const hasLegal = runtime.byCell
-        .get(key)
+      const hasLegal = forecastRowsForKey(key)
         .some(
           (row) => !placedIds.has(row.id) && Boolean(row.posMask & openMask),
         );
@@ -3404,7 +3479,7 @@
       : true;
     const filterHint =
       best && !recommendedCardVisible
-        ? `<div class="filter-hint">Clear search/filters to show <strong>${escapeHtml(best.row.player)}</strong>.</div>`
+        ? `<div class="filter-hint">Find <strong>${escapeHtml(best.row.player)}</strong> in the current list; clear search if a filter is active.</div>`
         : "";
     const formatRetry = (retry, available) => {
       if (!retry) return available ? "no legal outcomes" : "used";
@@ -3719,6 +3794,8 @@
     runtime.idleRecoveryScans = 0;
     runtime.officialResult = null;
     runtime.oneVsOneOpponent = null;
+    runtime.opponentPlayerIds = new Set();
+    runtime.currentVisibleRows = [];
     runtime.resultRecorded = false;
     runtime.sessionPayload = null;
     runtime.dealtSessionId = null;
@@ -3916,7 +3993,10 @@
       runtime.analysisInProgressKey = "";
     }
     runtime.lastCell = cell;
-    const cellRows = runtime.byCell.get(`${cell.team}|${cell.era}`) || [];
+    runtime.currentVisibleRows = [
+      ...new Map(cards.map((card) => [card.row.key, card.row])).values(),
+    ];
+    const cellRows = currentRowsForCell(cell);
     runtime.lastOffers = new Map(cellRows.map((row) => [row.player, row]));
     for (const row of cellRows) runtime.recentOffers.set(row.player, row);
     if (runtime.recentOffers.size > 700) runtime.recentOffers.clear();
@@ -3935,7 +4015,11 @@
       renderAnalyzing();
       return;
     }
-    const analysisKey = `${cell.team}|${cell.era}|opp:${runtime.oneVsOneOpponent?.score ?? "-"}|${entries
+    const squadSignature = runtime.dealtCell?.squad
+      ?.map((player) => String(player.player_id ?? player.id ?? player.name ?? ""))
+      .sort()
+      .join(",");
+    const analysisKey = `${cell.team}|${cell.era}|squad:${squadSignature || cellRows.map((row) => row.id).sort().join(",")}|opp:${runtime.oneVsOneOpponent?.score ?? "-"}|${entries
       .map((entry) => `${entry.row.key}@${entry.position}`)
       .sort()
       .join(

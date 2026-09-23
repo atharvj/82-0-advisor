@@ -20,6 +20,8 @@ The animated dots beside **Analyzing the roll** show that a calculation is still
 
 In 1v1, the site supplies the bot's completed score with the match session and decides the verdict by comparing the two raw scores. The coach now captures that target, shows it in the panel, and optimizes sampled probability of beating that specific bot instead of chasing the unrelated 82-0 threshold. Expected score breaks statistically uncertain ties. The final panel reports the actual score-versus-score matchup and also verifies the coach's score model against the site's returned user score.
 
+Every live recommendation is restricted to the exact player squad returned by the server for that roll. In 1v1, bot-owned player IDs are also removed from future-roll and retry forecasts, so the coach never recommends a historical team/era player who is not actually available in the match.
+
 Forecast records are expected values used for planning. Because 82-0's returned result is authoritative, the coach reads and displays the result shown by the site on the final screen. It also stores up to 100 anonymous results locally in the browser and shows the current version's average and best result, making strategy changes measurable without uploading any history.
 
 ## Guide

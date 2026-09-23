@@ -15,6 +15,7 @@ const {
   rolloutCandidateShortlist,
   matchupResult,
   opponentFromSessionPayload,
+  resolveSquadRows,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -76,6 +77,27 @@ assert.deepEqual(
   },
 );
 assert.equal(opponentFromSessionPayload({ opponent: { score: "bad" } }), null);
+
+const dealtOfferData = normalizeDataset([
+  { ...row("Billy Knight", "IND", "1970s", ["SF", "SG"], 22.6, 6.5, 2.9, 1.3, 0.2), id: "billy" },
+  { ...row("Adrian Dantley", "IND", "1970s", ["SF"], 26.5, 9.4, 2.8, 2.1, 0.7), id: "adrian" },
+]);
+const dealtById = new Map(
+  dealtOfferData.rows.map((candidate) => [String(candidate.id), candidate]),
+);
+const dealtByKey = new Map(
+  dealtOfferData.rows.map((candidate) => [candidate.key, candidate]),
+);
+assert.deepEqual(
+  resolveSquadRows(
+    [{ player_id: "billy" }],
+    dealtById,
+    dealtByKey,
+    { team: "IND", era: "1970s" },
+  ).map((candidate) => candidate.player),
+  ["Billy Knight"],
+  "live advice must exclude a historical cell player omitted from the server squad",
+);
 
 const stratifiedKeys = [
   "A|1960s",
