@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.2.0
-// @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
+// @version      2.3.0
+// @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
 // @match        https://82-0.com/*
@@ -14,8 +14,8 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.2.0";
-  const MODEL_VERIFIED = "2026-09-21";
+  const VERSION = "2.3.0";
+  const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
   const UI_KEY = "__82coach_ui_v1__";
@@ -51,14 +51,14 @@
   const ROLLOUT_CURRENT_ACTIONS = 32;
   const ROLLOUT_RETRY_ACTIONS = 1;
   const ROLLOUT_ROWS_PER_POSITION = 3;
-  const ONE_V_ONE_CURRENT_SAMPLES = 7;
+  const ONE_V_ONE_CURRENT_SAMPLES = 14;
   const ONE_V_ONE_RETRY_SAMPLES = 7;
-  const ONE_V_ONE_CURRENT_ACTIONS = 8;
+  const ONE_V_ONE_CURRENT_ACTIONS = 18;
   const ONE_V_ONE_RETRY_ACTIONS = 1;
   const ANALYSIS_YIELD_EVERY = 6;
   const CURRENT_ANALYSIS_MAX_MS = 5_000;
   const RETRY_ANALYSIS_MAX_MS = 1_500;
-  const ONE_V_ONE_ANALYSIS_MAX_MS = 900;
+  const ONE_V_ONE_ANALYSIS_MAX_MS = 1_500;
   const PATH_CONFIDENCE_Z = 1.645;
   const MIN_PATH_ADVANTAGE = 0.08;
 
@@ -94,6 +94,30 @@
 
   function roundOne(value) {
     return Math.round(value * 10) / 10;
+  }
+
+  function matchupResult(score, opponentScore) {
+    const user = roundOne(finiteNumber(score));
+    const opponent = roundOne(finiteNumber(opponentScore));
+    return user > opponent ? "win" : user < opponent ? "loss" : "draw";
+  }
+
+  function opponentFromSessionPayload(payload) {
+    const roots = [payload, payload?.result, payload?.data].filter(Boolean);
+    for (const root of roots) {
+      const opponent = root?.opponent;
+      if (!opponent || typeof opponent !== "object") continue;
+      const score = Number(opponent.score);
+      if (!Number.isFinite(score) || score < 0 || score > 200) continue;
+      return {
+        score,
+        roster: opponent.roster || null,
+        pickOrder: Array.isArray(opponent.pick_order)
+          ? [...opponent.pick_order]
+          : [],
+      };
+    }
+    return null;
   }
 
   function popcount(value) {
@@ -1043,6 +1067,8 @@
     stratifiedFutureKeys,
     rolloutCandidateShortlist,
     roundOne,
+    matchupResult,
+    opponentFromSessionPayload,
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
@@ -1184,6 +1210,7 @@
     idleRecoveryScans: 0,
     resultMismatchCandidate: null,
     officialResult: null,
+    oneVsOneOpponent: null,
     resultRecorded: false,
     modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
     mode: safeSessionGet(MODE_KEY) || "classic",
@@ -1580,8 +1607,11 @@
   function captureDealtSession(payload) {
     if (!payload?.session_id || !Array.isArray(payload.slots)) return;
     const sessionId = String(payload.session_id);
+    const opponent = opponentFromSessionPayload(payload);
+    if (opponent) setMode("1v1");
     if (runtime.dealtSessionId !== sessionId) resetRuntime(runtime.mode);
     runtime.dealtSessionId = sessionId;
+    runtime.oneVsOneOpponent = opponent;
     runtime.dealtCell = null;
     runtime.sessionPayload = null;
     runtime.shadowSession = null;
@@ -1593,6 +1623,7 @@
       "The site now deals future rolls on the server; future cells are hidden until they are played.";
     runtime.lastAnalysisKey = "";
     runtime.lastAnalysis = null;
+    runtime.analysisGeneration += 1;
     if (document.body) scheduleScan(0);
   }
 
@@ -2297,10 +2328,17 @@
 
   function compareForecastActions(left, right) {
     if (!right) return 1;
-    const leftPath =
-      left.forecastPathRate ?? Number(left.ceiling.possible82);
-    const rightPath =
-      right.forecastPathRate ?? Number(right.ceiling.possible82);
+    const opponentScore = runtime.oneVsOneOpponent?.score;
+    const matchupMode =
+      runtime.mode === "1v1" && Number.isFinite(opponentScore);
+    const leftPath = matchupMode
+      ? left.forecastMatchupRate ??
+        Number(matchupResult(left.ceiling.raw, opponentScore) === "win")
+      : left.forecastPathRate ?? Number(left.ceiling.possible82);
+    const rightPath = matchupMode
+      ? right.forecastMatchupRate ??
+        Number(matchupResult(right.ceiling.raw, opponentScore) === "win")
+      : right.forecastPathRate ?? Number(right.ceiling.possible82);
     const leftTrials = left.forecastOutcomes ?? 1;
     const rightTrials = right.forecastOutcomes ?? 1;
     if (
@@ -2443,6 +2481,19 @@
       action.forecastOutcomes = outcomes.length;
       action.forecastPathRate =
         action.forecastPathHits / action.forecastOutcomes;
+      const opponentScore = runtime.oneVsOneOpponent?.score;
+      if (runtime.mode === "1v1" && Number.isFinite(opponentScore)) {
+        action.forecastMatchupHits = outcomes.filter(
+          (raw) => matchupResult(raw, opponentScore) === "win",
+        ).length;
+        action.forecastDrawHits = outcomes.filter(
+          (raw) => matchupResult(raw, opponentScore) === "draw",
+        ).length;
+        action.forecastMatchupRate =
+          action.forecastMatchupHits / action.forecastOutcomes;
+        action.forecastDrawRate =
+          action.forecastDrawHits / action.forecastOutcomes;
+      }
       action.forecastDecisionRaw =
         action.forecastRaw + retryReserveBonus(remainingRounds, retryCount);
       action.forecastLow = roundOne(
@@ -2865,6 +2916,17 @@
           ((!action?.ceiling.possible82 && chain.action.ceiling.possible82) ||
             compareActions(chain.action, action) > 0),
       );
+      const opponentScore = runtime.oneVsOneOpponent?.score;
+      const directMatchupWin = Boolean(
+        action &&
+          Number.isFinite(opponentScore) &&
+          matchupResult(action.ceiling.raw, opponentScore) === "win",
+      );
+      const chainedMatchupWin = Boolean(
+        chain?.action &&
+          Number.isFinite(opponentScore) &&
+          matchupResult(chain.action.ceiling.raw, opponentScore) === "win",
+      );
       return {
         scope,
         exact: true,
@@ -2880,11 +2942,15 @@
         pathRate: action?.ceiling.possible82 ? 1 : 0,
         pathHits: action?.ceiling.possible82 ? 1 : 0,
         pathTrials: 1,
+        matchupRate: directMatchupWin ? 1 : 0,
+        matchupHits: directMatchupWin ? 1 : 0,
+        matchupTrials: 1,
         best: action || null,
         reachableLegal: Boolean(action || chain?.action),
         reachablePath: Boolean(
           action?.ceiling.possible82 || chain?.action?.ceiling.possible82,
         ),
+        reachableMatchup: directMatchupWin || chainedMatchupWin,
         decisionRaw: bestReachable?.ceiling.raw || 0,
         decisionScore: bestReachable?.ceiling.score || 0,
       };
@@ -2901,11 +2967,12 @@
     let totalWins = 0;
     let pathHits = 0;
     let pathTrials = 0;
+    let matchupHits = 0;
+    let matchupTrials = 0;
     let ceilingPathCount = 0;
     const limits = rolloutLimits();
     for (const alternative of cells) {
       if (outcomes.length && performance.now() >= deadline) break;
-      pathTrials += limits.retrySamples;
       await yieldToBrowser(shouldContinue);
       const result = await forecastEvaluation(
         evaluateCell(alternative, entries, false),
@@ -2919,6 +2986,13 @@
           shouldContinue,
         },
       );
+      const outcomeTrials = result.best?.forecastOutcomes ?? limits.retrySamples;
+      pathTrials += outcomeTrials;
+      if (
+        runtime.mode === "1v1" &&
+        Number.isFinite(runtime.oneVsOneOpponent?.score)
+      )
+        matchupTrials += outcomeTrials;
       if (!result.best) {
         outcomes.push({ cell: alternative, action: null });
         continue;
@@ -2935,6 +3009,7 @@
       pathHits +=
         result.best.forecastPathHits ??
         Number(result.best.ceiling.possible82);
+      matchupHits += result.best.forecastMatchupHits ?? 0;
       outcomes.push({ cell: alternative, action: result.best });
     }
     if (!outcomes.length) return null;
@@ -2959,6 +3034,9 @@
       pathRate: pathTrials ? pathHits / pathTrials : 0,
       pathHits,
       pathTrials,
+      matchupRate: matchupTrials ? matchupHits / matchupTrials : 0,
+      matchupHits,
+      matchupTrials,
       ceilingPathRate: ceilingPathCount / evaluatedCount,
       best,
       decisionRaw: totalDecisionRaw / evaluatedCount,
@@ -3018,12 +3096,22 @@
     priorCeiling,
     openSlots,
   ) {
+    const opponentScore = runtime.oneVsOneOpponent?.score;
+    const matchupMode =
+      runtime.mode === "1v1" && Number.isFinite(opponentScore);
     const retryLegal = (retry) =>
       retry?.reachableLegal ?? retry?.legalCount > 0;
     const retryValue = (retry) => retry?.decisionRaw ?? retry?.meanRaw ?? 0;
     const retryPath = (retry) =>
-      retry?.reachablePath ? 1 : retry?.pathRate ?? 0;
-    const retryTrials = (retry) => retry?.pathTrials ?? 1;
+      matchupMode
+        ? retry?.reachableMatchup
+          ? 1
+          : retry?.matchupRate ?? 0
+        : retry?.reachablePath
+          ? 1
+          : retry?.pathRate ?? 0;
+    const retryTrials = (retry) =>
+      matchupMode ? retry?.matchupTrials ?? 1 : retry?.pathTrials ?? 1;
     const availableRetries = [
       retries.team.available && teamRetry ? teamRetry : null,
       retries.era.available && eraRetry ? eraRetry : null,
@@ -3069,7 +3157,11 @@
       current.best.forecastRaw ??
       current.best.ceiling.raw;
     const currentPath =
-      current.best.forecastPathRate ?? Number(current.best.ceiling.possible82);
+      matchupMode
+        ? current.best.forecastMatchupRate ??
+          Number(matchupResult(current.best.ceiling.raw, opponentScore) === "win")
+        : current.best.forecastPathRate ??
+          Number(current.best.ceiling.possible82);
     const expectedGain = retryValue(bestRetry) - currentValue;
     const pathGainIsMeaningful = meaningfulRateAdvantage(
       retryPath(bestRetry),
@@ -3077,15 +3169,21 @@
       currentPath,
       current.best.forecastOutcomes ?? 1,
     );
+    const pathLossIsMeaningful = meaningfulRateAdvantage(
+      currentPath,
+      current.best.forecastOutcomes ?? 1,
+      retryPath(bestRetry),
+      retryTrials(bestRetry),
+    );
     if (pathGainIsMeaningful && expectedGain > -0.75) {
       return {
         kind: bestRetry.scope,
         reason: bestRetry.chainRecommended
-          ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; this is the stronger route to 82-0.`
-          : `This retry gives the stronger sampled route to 82-0 (${Math.round(currentPath * 100)}% → ${Math.round(retryPath(bestRetry) * 100)}%).`,
+          ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; this is the stronger ${matchupMode ? "route to beat the bot" : "route to 82-0"}.`
+          : `This retry gives the stronger sampled ${matchupMode ? "win chance" : "route to 82-0"} (${Math.round(currentPath * 100)}% → ${Math.round(retryPath(bestRetry) * 100)}%).`,
       };
     }
-    if (expectedGain > 0.25 + EPSILON) {
+    if (!pathLossIsMeaningful && expectedGain > 0.25 + EPSILON) {
       return {
         kind: bestRetry.scope,
         reason: bestRetry.chainRecommended
@@ -3138,12 +3236,20 @@
     const seededResult = advice.seededPlan?.result || null;
     const isRetry = advice.kind === "team" || advice.kind === "era";
     const move = advice.kind === "pick" ? best?.moves?.[0] : null;
+    const isOneVsOne = runtime.mode === "1v1";
+    const opponentScore = runtime.oneVsOneOpponent?.score;
+    const hasOpponentScore = Number.isFinite(opponentScore);
     const retriesAvailable = retries.team.available || retries.era.available;
     const retryCanRestoreCeiling = Boolean(
-      (advice.teamRetry?.reachablePath ??
-        advice.teamRetry?.ceilingPathRate > 0) ||
-        (advice.eraRetry?.reachablePath ??
-          advice.eraRetry?.ceilingPathRate > 0),
+      isOneVsOne && hasOpponentScore
+        ? (advice.teamRetry?.reachableMatchup ??
+            advice.teamRetry?.matchupRate > 0) ||
+            (advice.eraRetry?.reachableMatchup ??
+              advice.eraRetry?.matchupRate > 0)
+        : (advice.teamRetry?.reachablePath ??
+            advice.teamRetry?.ceilingPathRate > 0) ||
+            (advice.eraRetry?.reachablePath ??
+              advice.eraRetry?.ceilingPathRate > 0),
     );
     const availableRetrySummaries = [
       retries.team.available ? advice.teamRetry : null,
@@ -3158,11 +3264,17 @@
     );
     const impossible =
       !runtime.modelMismatch &&
-      (seededResult
-        ? !seededResult.possible82
-        : advice.priorCeiling && !advice.priorCeiling.possible82);
+      (isOneVsOne && hasOpponentScore
+        ? advice.priorCeiling &&
+          matchupResult(advice.priorCeiling.raw, opponentScore) !== "win"
+        : seededResult
+          ? !seededResult.possible82
+          : advice.priorCeiling && !advice.priorCeiling.possible82);
     const currentCanKeepCeiling = current.actions.some(
-      (action) => action.ceiling.possible82,
+      (action) =>
+        isOneVsOne && hasOpponentScore
+          ? matchupResult(action.ceiling.raw, opponentScore) === "win"
+          : action.ceiling.possible82,
     );
     const forcedImpossible =
       !runtime.modelMismatch &&
@@ -3179,8 +3291,12 @@
           ? advice.eraRetry
           : null;
     const recommendedKeepsCeiling = isRetry
-      ? chosenRetry?.reachablePath ?? chosenRetry?.ceilingPathRate > 0
-      : best?.ceiling.possible82;
+      ? isOneVsOne && hasOpponentScore
+        ? chosenRetry?.reachableMatchup ?? chosenRetry?.matchupRate > 0
+        : chosenRetry?.reachablePath ?? chosenRetry?.ceilingPathRate > 0
+      : isOneVsOne && hasOpponentScore
+        ? best && matchupResult(best.ceiling.raw, opponentScore) === "win"
+        : best?.ceiling.possible82;
     const atRisk =
       !runtime.modelMismatch &&
       !seededResult &&
@@ -3190,9 +3306,22 @@
     const sampledPathRate = seededResult
       ? Number(seededResult.possible82)
       : isRetry
-        ? chosenRetry?.pathRate || 0
-        : best?.forecastPathRate || 0;
+        ? isOneVsOne && hasOpponentScore
+          ? chosenRetry?.matchupRate || 0
+          : chosenRetry?.pathRate || 0
+        : isOneVsOne && hasOpponentScore
+          ? best?.forecastMatchupRate || 0
+          : best?.forecastPathRate || 0;
     const sampledPathPercent = Math.round(sampledPathRate * 100);
+    const bestReachableScore = roundOne(
+      Math.max(
+        0,
+        ...current.actions.map((action) => action.ceiling.raw),
+        ...availableRetrySummaries.map(
+          (retry) => retry.best?.ceiling.raw || 0,
+        ),
+      ),
+    );
     const statusColor = runtime.modelMismatch
       ? COLORS.team
       : impossible || forcedImpossible
@@ -3202,19 +3331,22 @@
           : COLORS.pick;
     const statusText = runtime.modelMismatch
       ? "Site model changed — recommendations are provisional"
+      : isOneVsOne
+        ? hasOpponentScore
+          ? impossible
+            ? `Bot score ${opponentScore.toFixed(1)} · win impossible · absolute max ${advice.priorCeiling.score.toFixed(1)}`
+            : forcedImpossible
+              ? `Bot score ${opponentScore.toFixed(1)} · win now unreachable · best reachable ${bestReachableScore.toFixed(1)}`
+            : sampledPathPercent
+              ? `Bot score to beat ${opponentScore.toFixed(1)} · ${sampledPathPercent}% sampled win chance`
+              : `Bot score to beat ${opponentScore.toFixed(1)} · a win remains possible`
+          : "1v1 · optimizing the highest final score"
       : impossible
         ? seededResult
           ? `82-0 impossible · exact seeded max ${seededResult.score.toFixed(1)}`
           : `82-0 impossible · absolute max ${advice.priorCeiling.score.toFixed(1)}`
         : forcedImpossible
-          ? `82-0 now impossible · best reachable max ${roundOne(
-              Math.max(
-                ...current.actions.map((action) => action.ceiling.raw),
-                ...availableRetrySummaries.map(
-                  (retry) => retry.best?.ceiling.raw || 0,
-                ),
-              ),
-            ).toFixed(1)}`
+          ? `82-0 now impossible · best reachable max ${bestReachableScore.toFixed(1)}`
           : atRisk
             ? "82-0 remains mathematically possible · recommendation favors the higher average"
             : seededResult
@@ -3253,7 +3385,9 @@
     const pickedResult = calculateTeamResult(entries.map((entry) => entry.row));
     const currentLine = best ? scoreText(best.ceiling) : "—";
     const expectedLine = Number.isFinite(best?.forecastScore)
-      ? `${best.forecastScore.toFixed(1)} avg · ${best.forecastWins.toFixed(0)} wins avg`
+      ? isOneVsOne && hasOpponentScore
+        ? `${best.forecastScore.toFixed(1)} avg · ${Math.round((best.forecastMatchupRate || 0) * 100)}% sampled win chance`
+        : `${best.forecastScore.toFixed(1)} avg · ${best.forecastWins.toFixed(0)} wins avg`
       : currentLine;
 
     const stats = best
@@ -3277,13 +3411,17 @@
       if (retry.exact) {
         const cellText = `${retry.predictedCell.team} ${retry.predictedCell.era}`;
         const direct = retry.legalCount
-          ? `${cellText} · ${retry.meanScore.toFixed(1)} · ${retry.pathRate ? "keeps 82 path" : "loses 82 path"}`
+          ? isOneVsOne && hasOpponentScore
+            ? `${cellText} · ${retry.meanScore.toFixed(1)} · ${retry.matchupRate ? "beats bot" : "does not beat bot"}`
+            : `${cellText} · ${retry.meanScore.toFixed(1)} · ${retry.pathRate ? "keeps 82 path" : "loses 82 path"}`
           : `${cellText} · no legal UI pick`;
         if (!retry.chainRecommended || advice.seededPlan) return direct;
         const chained = retry.chain;
         return `${direct}; then ${chained.scope.toUpperCase()} → ${chained.cell.team} ${chained.cell.era} · ${chained.action.ceiling.score.toFixed(1)}`;
       }
-      return `${retry.meanScore.toFixed(1)} avg · ${retry.meanWins.toFixed(0)} wins avg · ${Math.round(retry.pathRate * 100)}% sampled 82`;
+      return isOneVsOne && hasOpponentScore
+        ? `${retry.meanScore.toFixed(1)} avg · ${Math.round((retry.matchupRate || 0) * 100)}% sampled win chance`
+        : `${retry.meanScore.toFixed(1)} avg · ${retry.meanWins.toFixed(0)} wins avg · ${Math.round(retry.pathRate * 100)}% sampled 82`;
     };
     const teamForecast = formatRetry(advice.teamRetry, retries.team.available);
     const eraForecast = formatRetry(advice.eraRetry, retries.era.available);
@@ -3291,8 +3429,12 @@
       ? seededResult
         ? scoreText(seededResult)
         : chosenRetry.exact
-          ? `${(chosenRetry.chainRecommended ? chosenRetry.decisionScore : chosenRetry.meanScore).toFixed(1)} · ${(chosenRetry.reachablePath ?? chosenRetry.pathRate) ? "82 path" : "no 82 path"}`
-          : `${chosenRetry.meanScore.toFixed(1)} avg · ${chosenRetry.meanWins.toFixed(0)} wins avg`
+          ? isOneVsOne && hasOpponentScore
+            ? `${(chosenRetry.chainRecommended ? chosenRetry.decisionScore : chosenRetry.meanScore).toFixed(1)} · ${(chosenRetry.reachableMatchup ?? chosenRetry.matchupRate) ? "beats bot" : "below bot"}`
+            : `${(chosenRetry.chainRecommended ? chosenRetry.decisionScore : chosenRetry.meanScore).toFixed(1)} · ${(chosenRetry.reachablePath ?? chosenRetry.pathRate) ? "82 path" : "no 82 path"}`
+          : isOneVsOne && hasOpponentScore
+            ? `${chosenRetry.meanScore.toFixed(1)} avg · ${Math.round((chosenRetry.matchupRate || 0) * 100)}% sampled win chance`
+            : `${chosenRetry.meanScore.toFixed(1)} avg · ${chosenRetry.meanWins.toFixed(0)} wins avg`
       : expectedLine;
 
     const seededRoute = advice.seededPlan?.steps?.length
@@ -3316,6 +3458,7 @@
     const details = ui.details
       ? `<div class="details">
           <div class="row"><span>Picked team now</span><strong>${entries.length}/5 · ${scoreText(pickedResult)}</strong></div>
+          ${isOneVsOne && hasOpponentScore ? `<div class="row"><span>Bot score to beat</span><strong>${opponentScore.toFixed(1)}</strong></div>` : ""}
           <div class="row"><span>Expected final</span><strong>${escapeHtml(expectedLine)}</strong></div>
           <div class="row"><span>Best current-pool ceiling</span><strong>${escapeHtml(currentLine)}</strong></div>
           ${seededResult ? `<div class="row"><span>Exact seeded final maximum</span><strong>${escapeHtml(scoreText(seededResult))}</strong></div>` : ""}
@@ -3379,6 +3522,7 @@
       forcedImpossible,
       seeded: seededResult?.raw,
       mismatch: runtime.modelMismatch,
+      opponentScore,
       details: ui.details,
       team: teamForecast,
       era: eraForecast,
@@ -3448,38 +3592,78 @@
     const score = Number.isFinite(officialScore)
       ? officialScore
       : calculated?.score ?? pageScore;
+    const opponentScore = runtime.oneVsOneOpponent?.score;
+    const isOneVsOneResult =
+      runtime.mode === "1v1" &&
+      Number.isFinite(score) &&
+      Number.isFinite(opponentScore);
+    const verdict = isOneVsOneResult
+      ? matchupResult(score, opponentScore)
+      : null;
     const possible82 = displayed.wins === 82;
-    const color = possible82 ? COLORS.pick : COLORS.impossible;
-    const sourceLine = official
-      ? calculated
-        ? "Final result from 82-0 · score checked from all five selected peaks."
-        : "Final result shown by 82-0."
-      : "Record projected with the current 82-0 curve; score exactly recomputed from all five peaks.";
+    const color = isOneVsOneResult
+      ? verdict === "win"
+        ? COLORS.pick
+        : verdict === "draw"
+          ? COLORS.team
+          : COLORS.impossible
+      : possible82
+        ? COLORS.pick
+        : COLORS.impossible;
+    const sourceLine = isOneVsOneResult
+      ? official
+        ? calculated
+          ? "1v1 result from 82-0 · your score checked from all five selected peaks."
+          : "1v1 result shown by 82-0."
+        : "Matchup projected from your five peaks and the bot score supplied with this session."
+      : official
+        ? calculated
+          ? "Final result from 82-0 · score checked from all five selected peaks."
+          : "Final result shown by 82-0."
+        : "Record projected with the current 82-0 curve; score exactly recomputed from all five peaks.";
     const historySummary = official
       ? resultHistorySummary(recordCompletedGame(displayed, score))
       : "";
+    const resultStatus = isOneVsOneResult
+      ? verdict === "win"
+        ? "1v1 won"
+        : verdict === "draw"
+          ? "1v1 draw"
+          : "1v1 lost"
+      : possible82
+        ? "82-0 achieved"
+        : "Final team";
+    const resultPrimary = isOneVsOneResult
+      ? `${score.toFixed(1)} · ${opponentScore.toFixed(1)}`
+      : `${displayed.wins}-${displayed.losses} · ${Number.isFinite(score) ? score.toFixed(1) : "—"}`;
     renderPanel(
-      `<div class="status" style="--status:${color}"><span class="dot"></span><span>${possible82 ? "82-0 achieved" : "Final team"}</span></div>
-       <div class="action" style="--action:${color}"><div class="eyebrow">FINAL RESULT</div><div class="primary"><span class="name">${displayed.wins}-${displayed.losses}</span><span class="arrow">·</span><span class="position">${Number.isFinite(score) ? score.toFixed(1) : "—"}</span></div><div class="sub">${escapeHtml(sourceLine)}${historySummary ? `<br>${escapeHtml(historySummary)}` : ""}</div></div>`,
-      `result:${score}:${displayed.wins}:${runtime.mode}:${official ? "official" : "projected"}`,
+      `<div class="status" style="--status:${color}"><span class="dot"></span><span>${resultStatus}</span></div>
+       <div class="action" style="--action:${color}"><div class="eyebrow">${isOneVsOneResult ? "YOU · BOT" : "FINAL RESULT"}</div><div class="primary"><span class="name">${resultPrimary}</span></div><div class="sub">${escapeHtml(sourceLine)}${historySummary ? `<br>${escapeHtml(historySummary)}` : ""}</div></div>`,
+      `result:${score}:${displayed.wins}:${runtime.mode}:${opponentScore}:${official ? "official" : "projected"}`,
     );
     if (calculated) checkModelDrift(calculated);
     return true;
   }
 
   function checkModelDrift(calculated) {
-    if (runtime.mode === "1v1" || runtime.modelMismatch) return;
-    const candidates = [];
-    for (const element of document.querySelectorAll("span,p")) {
-      const text = directText(element);
-      const match = text.match(/(?:^|·\s*)([\d,.]+)\s*pts\s*$/i);
-      if (!match) continue;
-      const value = Number(match[1].replaceAll(",", ""));
-      if (Number.isFinite(value) && value >= 0 && value <= 200)
-        candidates.push(value);
+    if (runtime.modelMismatch) return;
+    let displayed = null;
+    if (runtime.mode === "1v1") {
+      displayed = runtime.officialResult?.score;
+      if (!Number.isFinite(displayed)) return;
+    } else {
+      const candidates = [];
+      for (const element of document.querySelectorAll("span,p")) {
+        const text = directText(element);
+        const match = text.match(/(?:^|·\s*)([\d,.]+)\s*pts\s*$/i);
+        if (!match) continue;
+        const value = Number(match[1].replaceAll(",", ""));
+        if (Number.isFinite(value) && value >= 0 && value <= 200)
+          candidates.push(value);
+      }
+      if (candidates.length !== 1) return;
+      displayed = candidates[0];
     }
-    if (candidates.length !== 1) return;
-    const displayed = candidates[0];
     if (Math.abs(displayed - calculated.score) <= 0.11) {
       runtime.resultMismatchCandidate = null;
       return;
@@ -3534,6 +3718,7 @@
     runtime.emptyTraySince = 0;
     runtime.idleRecoveryScans = 0;
     runtime.officialResult = null;
+    runtime.oneVsOneOpponent = null;
     runtime.resultRecorded = false;
     runtime.sessionPayload = null;
     runtime.dealtSessionId = null;
@@ -3750,7 +3935,7 @@
       renderAnalyzing();
       return;
     }
-    const analysisKey = `${cell.team}|${cell.era}|${entries
+    const analysisKey = `${cell.team}|${cell.era}|opp:${runtime.oneVsOneOpponent?.score ?? "-"}|${entries
       .map((entry) => `${entry.row.key}@${entry.position}`)
       .sort()
       .join(

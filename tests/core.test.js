@@ -13,6 +13,8 @@ const {
   bestRolloutSequenceRaw,
   stratifiedFutureKeys,
   rolloutCandidateShortlist,
+  matchupResult,
+  opponentFromSessionPayload,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -55,6 +57,25 @@ assert.equal(
   true,
   "a large statistically meaningful path advantage must be recognized",
 );
+assert.equal(matchupResult(98.04, 98), "draw");
+assert.equal(matchupResult(98.06, 98), "win");
+assert.equal(matchupResult(97.94, 98), "loss");
+assert.deepEqual(
+  opponentFromSessionPayload({
+    session_id: "one-v-one",
+    opponent: {
+      score: 97.8,
+      roster: { PG: { player_id: "bot-pg" } },
+      pick_order: ["PG"],
+    },
+  }),
+  {
+    score: 97.8,
+    roster: { PG: { player_id: "bot-pg" } },
+    pickOrder: ["PG"],
+  },
+);
+assert.equal(opponentFromSessionPayload({ opponent: { score: "bad" } }), null);
 
 const stratifiedKeys = [
   "A|1960s",
