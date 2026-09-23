@@ -12,20 +12,20 @@ The current site deals future rolls from its server and no longer exposes them i
 
 Forecasts simulate the decision the coach could actually make when each future roll becomes visible; they do not select future players with hindsight. Every serious current action is compared, and simulated future picks use a real-dataset-tested blend of accumulated team score and positional ceiling. A sampled 82-0 advantage overrides expected score only when it is large enough to be statistically meaningful. The value of preserving unused retries is carried through the remaining rounds.
 
-The coach is advisory only: it highlights recommendations without blocking any player, position, or retry button. Use the `⏻` button in its header to turn the coach off for as many games as you want; the small **Coach off** pill remains available to turn it back on.
+The coach is advisory only and panel-only: it reads the draft state but never outlines, relabels, disables, or otherwise modifies the website's player cards, positions, and retry buttons. All instructions appear in the side panel. Use the `⏻` button in its header to turn the coach off for as many games as you want; the small **Coach off** pill remains available to turn it back on.
 
 When a pick needs multiple lineup moves, the coach routes every move through the currently empty position and shows the rest of the sequence under the first instruction. It never begins with an occupied-position swap that can reverse on the next scan.
 
-The animated dots beside **Analyzing the roll** show that a calculation is still running. Classic and Hoop IQ use 28 balanced future scenarios; 1v1 uses a shorter seven-scenario forecast. Future pools are reduced to statistically strong finalists before expensive ceiling checks, and every analysis stage has a hard time budget so the panel always returns advice. If Team or Era retry is the recommendation, the original retry button keeps its text and gets a prominent border/glow; the fallback player is not highlighted.
+The animated dots beside **Analyzing the roll** show that a calculation is still running. Classic and Hoop IQ use 28 balanced future scenarios; 1v1 uses a shorter seven-scenario forecast. Future pools are reduced to statistically strong finalists before expensive ceiling checks, and every analysis stage has a hard time budget so the panel always returns advice. Team and Era retry recommendations are written clearly in the panel while the site's controls remain untouched.
 
 Forecast records are expected values used for planning. Because 82-0's returned result is authoritative, the coach reads and displays the result shown by the site on the final screen. It also stores up to 100 anonymous results locally in the browser and shows the current version's average and best result, making strategy changes measurable without uploading any history.
 
 ## Guide
 
-- Green: pick this player
-- Blue: use this position or make this move
-- Orange: Team retry
-- Purple: Era retry
-- Red: 82-0 is impossible; the coach still shows the highest-scoring route
+- Green panel: pick this player
+- Blue panel: make the displayed position move
+- Orange panel: Team retry
+- Purple panel: Era retry
+- Red panel: 82-0 is impossible; the coach still shows the highest-scoring route
 
 Open **Why this choice?** to see the current ceiling and retry forecasts. Press `Alt+A` to hide or restore the coach.

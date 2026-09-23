@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.1.2
+// @version      2.2.0
 // @description  Live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,10 +14,9 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.1.2";
+  const VERSION = "2.2.0";
   const MODEL_VERIFIED = "2026-09-21";
   const PANEL_ID = "__82coach_host__";
-  const SITE_STYLE_ID = "__82coach_site_style__";
   const DATASET_WAIT_MS = 15_000;
   const UI_KEY = "__82coach_ui_v1__";
   const MODE_KEY = "__82coach_mode_v1__";
@@ -1351,61 +1350,6 @@
       rect.height > 0 &&
       element.getClientRects().length > 0
     );
-  }
-
-  function installSiteStyles() {
-    if (document.getElementById(SITE_STYLE_ID)) return;
-    const style = document.createElement("style");
-    style.id = SITE_STYLE_ID;
-    style.textContent = `
-      [data-82coach-card] {
-        position: relative !important;
-        outline: 3px solid var(--82coach-color) !important;
-        outline-offset: -2px !important;
-        box-shadow: 0 0 0 2px rgba(2,6,23,.8), 0 0 18px color-mix(in srgb, var(--82coach-color) 55%, transparent) !important;
-      }
-      [data-82coach-card]::after {
-        content: attr(data-82coach-label);
-        position: absolute;
-        top: 5px;
-        right: 7px;
-        z-index: 5;
-        padding: 2px 7px;
-        border-radius: 999px;
-        background: var(--82coach-color);
-        color: #081018;
-        font: 800 10px/1.35 system-ui, sans-serif;
-        letter-spacing: .03em;
-        pointer-events: none;
-      }
-      [data-82coach-card^="fallback"] { outline-style: dashed !important; }
-      [data-82coach-position="true"] {
-        outline: 3px solid ${COLORS.position} !important;
-        outline-offset: 3px !important;
-        box-shadow: 0 0 18px rgba(56,189,248,.72) !important;
-      }
-      [data-82coach-retry="team"] {
-        position: relative !important;
-        z-index: 25 !important;
-        box-sizing: border-box !important;
-        border: 4px solid #fff7d6 !important;
-        border-radius: 999px !important;
-        outline: 5px solid #f59e0b !important;
-        outline-offset: 3px !important;
-        box-shadow: inset 0 0 0 3px #f59e0b, 0 0 0 9px rgba(245,158,11,.3), 0 0 34px 12px rgba(245,158,11,.9) !important;
-      }
-      [data-82coach-retry="era"] {
-        position: relative !important;
-        z-index: 25 !important;
-        box-sizing: border-box !important;
-        border: 4px solid #f5e8ff !important;
-        border-radius: 999px !important;
-        outline: 5px solid #a855f7 !important;
-        outline-offset: 3px !important;
-        box-shadow: inset 0 0 0 3px #a855f7, 0 0 0 9px rgba(168,85,247,.32), 0 0 34px 12px rgba(168,85,247,.9) !important;
-      }
-    `;
-    document.head.appendChild(style);
   }
 
   function getPanel() {
@@ -3159,18 +3103,7 @@
   }
 
   function clearHighlights() {
-    for (const element of document.querySelectorAll(
-      "[data-82coach-card],[data-82coach-locked],[data-82coach-position],[data-82coach-retry],[data-82coach-retry-muted]",
-    )) {
-      element.removeAttribute("data-82coach-card");
-      element.removeAttribute("data-82coach-label");
-      element.removeAttribute("data-82coach-locked");
-      element.removeAttribute("data-82coach-position");
-      element.removeAttribute("data-82coach-retry");
-      element.removeAttribute("data-82coach-retry-label");
-      element.removeAttribute("data-82coach-retry-muted");
-      element.style.removeProperty("--82coach-color");
-    }
+    // Panel-only mode deliberately leaves the website DOM untouched.
   }
 
   function controlPosition(element) {
@@ -3192,122 +3125,6 @@
         ),
       ) || null
     );
-  }
-
-  function controlHasPlayer(element) {
-    const label = element.getAttribute?.("aria-label") || "";
-    const position = controlPosition(element);
-    if (position && new RegExp(`^${position}\\s*:`).test(label)) return true;
-    return [...element.querySelectorAll("p")].some((paragraph) =>
-      runtime.namesSet.has(paragraph.textContent.trim()),
-    );
-  }
-
-  function findPositionTargets(
-    position,
-    { includeTray = false, openOnly = true } = {},
-  ) {
-    const targets = new Set();
-    const court = document.querySelector('svg[viewBox="0 0 500 700"]');
-    const courtRoot = court?.parentElement?.parentElement;
-    if (courtRoot) {
-      for (const button of courtRoot.querySelectorAll("button")) {
-        if (
-          isVisible(button) &&
-          controlPosition(button) === position &&
-          (!openOnly || !controlHasPlayer(button))
-        ) {
-          targets.add(button);
-        }
-      }
-    }
-    const tray = includeTray
-      ? document.querySelector("[data-lineup-tray]")
-      : null;
-    if (tray && isVisible(tray)) {
-      for (const slot of tray.querySelectorAll('[role="button"]')) {
-        if (
-          isVisible(slot) &&
-          controlPosition(slot) === position &&
-          (!openOnly || !controlHasPlayer(slot))
-        ) {
-          targets.add(slot);
-        }
-      }
-    }
-    const sheet = document.querySelector('[data-slot="sheet-content"]');
-    if (sheet) {
-      for (const button of sheet.querySelectorAll("button")) {
-        if (
-          isVisible(button) &&
-          controlPosition(button) === position &&
-          (!openOnly || !controlHasPlayer(button))
-        ) {
-          targets.add(button);
-        }
-      }
-    }
-    for (const control of document.querySelectorAll(
-      'button[data-track-name="draft_slot_place"],[data-court-slot]',
-    )) {
-      if (
-        isVisible(control) &&
-        controlPosition(control) === position &&
-        (!openOnly || !controlHasPlayer(control))
-      ) {
-        targets.add(control);
-      }
-    }
-    return [...targets];
-  }
-
-  function applyHighlights(advice, cards, retries) {
-    clearHighlights();
-    const fallback = advice.current?.best;
-    const isRetry = advice.kind === "team" || advice.kind === "era";
-    const move = advice.kind === "pick" ? fallback?.moves?.[0] : null;
-
-    if (isRetry) {
-      const retryElement = retries[advice.kind]?.element;
-      retryElement?.setAttribute("data-82coach-retry", advice.kind);
-    }
-
-    if (move) {
-      for (const position of [move.from, move.to]) {
-        for (const target of findPositionTargets(position, {
-          includeTray: true,
-          openOnly: false,
-        })) {
-          target.setAttribute("data-82coach-position", "true");
-        }
-      }
-      return;
-    }
-
-    if (!fallback) return;
-    const card = cards.find(
-      ({ row, element }) => row.key === fallback.row.key && isVisible(element),
-    )?.element;
-
-    // When a retry is best, highlighting the fallback player competes with the
-    // actual recommendation. Keep the fallback in the details panel only.
-    if (card && !isRetry) {
-      card.setAttribute(
-        "data-82coach-card",
-        "pick",
-      );
-      card.setAttribute(
-        "data-82coach-label",
-        `PICK · ${fallback.position}`,
-      );
-      card.style.setProperty("--82coach-color", COLORS.pick);
-    }
-
-    if (!isRetry) {
-      for (const target of findPositionTargets(fallback.position)) {
-        target.setAttribute("data-82coach-position", "true");
-      }
-    }
   }
 
   function scoreText(result) {
@@ -3567,7 +3384,6 @@
       era: eraForecast,
     });
     renderPanel(html, signature);
-    applyHighlights(advice, cards, retries);
   }
 
   function findResultButton() {
@@ -4119,7 +3935,6 @@
   }
 
   function bootstrap() {
-    installSiteStyles();
     getPanel();
     document.addEventListener("click", handleDocumentClick, true);
     document.addEventListener("dragstart", handleDragStart, true);
