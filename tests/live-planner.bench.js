@@ -5,7 +5,7 @@
 // identical initial offers; retries preserve their actual Team/Era dimension.
 const assert = require("node:assert/strict");
 const {
-  LiveDraftPlanner, bestLivePick, rawTeamScore, MulberryRng,
+  LiveDraftPlanner, FixedSlotDraftPlanner, bestLivePick, rawTeamScore, MulberryRng,
 } = require("../82-0-advisor.user.js");
 const samples = require("./fixtures/v4-roll-samples.json");
 const pools = samples.map(([teamId, era, players]) => ({
@@ -15,13 +15,13 @@ const pools = samples.map(([teamId, era, players]) => ({
   })),
 }));
 const games = 500;
-const totals = [0, 0];
-const retries = { team: 0, era: 0 };
+const totals = [0, 0, 0];
+const retries = Array.from({ length: 3 }, () => ({ team: 0, era: 0 }));
 let maxAnalysisMs = 0;
 for (let game = 0; game < games; game += 1) {
   const rng = new MulberryRng(8192 + game);
   const initial = Array.from({ length: 5 }, () => pools[Math.floor(rng.next() * pools.length)]);
-  for (let policy = 0; policy < 2; policy += 1) {
+  for (let policy = 0; policy < 3; policy += 1) {
     const entries = [];
     const tokens = { team: true, era: true };
     const retryRng = new MulberryRng(32768 + game);
@@ -34,14 +34,14 @@ for (let game = 0; game < games; game += 1) {
         };
         const start = performance.now();
         const advice = policy
-          ? new LiveDraftPlanner(pools, entries).advise(cell.rows, cell, {
+          ? new (policy === 1 ? FixedSlotDraftPlanner : LiveDraftPlanner)(pools, entries).advise(cell.rows, cell, {
             team: tokens.team && alternatives.team.length > 0,
             era: tokens.era && alternatives.era.length > 0,
           }) : { kind: "pick", best: bestLivePick(cell.rows, entries) };
         maxAnalysisMs = Math.max(maxAnalysisMs, performance.now() - start);
         if (advice.kind === "team" || advice.kind === "era") {
           tokens[advice.kind] = false;
-          retries[advice.kind] += 1;
+          retries[policy][advice.kind] += 1;
           const options = alternatives[advice.kind];
           cell = options[Math.floor(retryRng.next() * options.length)];
           continue;
@@ -58,13 +58,16 @@ for (let game = 0; game < games; game += 1) {
   }
 }
 const averages = totals.map((total) => total / games);
-assert.ok(averages[1] > averages[0] + 1,
+assert.ok(averages[2] > averages[0] + 1,
   "position/retry planning must beat the previous no-retry greedy policy in this model");
-assert.ok(retries.team > 0 && retries.era > 0,
+assert.ok(averages[2] > averages[1],
+  "flexible-roster score planning must beat the previous fixed-slot planner in this model");
+assert.ok(retries[2].team > 0 && retries[2].era > 0,
   "the live planner must actually use both retry kinds when useful");
 console.log(JSON.stringify({
   simulatedGamesPerPolicy: games,
-  meanCalculatedScore: { previousGreedy: averages[0], positionRetryPlanner: averages[1] },
+  meanCalculatedScore: { previousGreedy: averages[0], previousFixedSlotPlanner: averages[1],
+    flexibleRosterPlanner: averages[2] },
   recommendedRetries: retries,
   maxAnalysisMs,
 }, null, 2));

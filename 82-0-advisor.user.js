@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.5.0
+// @version      2.6.0
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.5.0";
+  const VERSION = "2.6.0";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -278,7 +278,7 @@
   // of closing that position, and using a retry sacrifices its later value.
   // Future offers are a sampled model, not known deals. Hypothetical future
   // player-name collisions and lineup moves are not in this compact state.
-  class LiveDraftPlanner {
+  class FixedSlotDraftPlanner {
     constructor(pools, entries) {
       this.entries = entries;
       this.fixed = entries.map((entry) => entry.row);
@@ -287,6 +287,7 @@
         ...pool, rows: pool.rows.filter((row) => !used.has(row.player)),
       }));
       this.memo = new Map();
+      this.retryTableMemo = new WeakMap();
       const rows = this.pools.flatMap((pool) => pool.rows);
       // Predict recorded-defense counts rather than treating old missing stats
       // as zero contributions to a five-player denominator.
@@ -308,15 +309,36 @@
       // Exclude the unchanged dimension's present outcome. Conditional samples
       // are shrunk toward the global sample (eight pseudo-cells) to avoid
       // recommending retries on the strength of one lucky historical offer.
-      const eligible = this.pools.map((pool, index) => ({ pool, value: table[index] }))
-        .filter(({ pool }) => scope === "team"
-          ? pool.teamId !== cell.teamId : pool.era !== cell.era);
-      if (!eligible.length) return null;
-      const conditional = eligible.filter(({ pool }) => scope === "team"
-        ? pool.era === cell.era : pool.teamId === cell.teamId);
-      const global = eligible.reduce((sum, entry) => sum + entry.value, 0) / eligible.length;
-      return (conditional.reduce((sum, entry) => sum + entry.value, 0) + 8 * global) /
-        (conditional.length + 8);
+      if (!this.retryTableMemo.has(table)) {
+        const summary = { sum: 0, count: table.length, teams: new Map(),
+          eras: new Map(), cells: new Map() };
+        const add = (map, key, value) => {
+          const group = map.get(key) || { sum: 0, count: 0 };
+          group.sum += value;
+          group.count += 1;
+          map.set(key, group);
+        };
+        for (let index = 0; index < this.pools.length; index += 1) {
+          const pool = this.pools[index];
+          summary.sum += table[index];
+          add(summary.teams, pool.teamId, table[index]);
+          add(summary.eras, pool.era, table[index]);
+          add(summary.cells, `${pool.teamId}|${pool.era}`, table[index]);
+        }
+        this.retryTableMemo.set(table, summary);
+      }
+      const summary = this.retryTableMemo.get(table);
+      const empty = { sum: 0, count: 0 };
+      const excluded = (scope === "team" ? summary.teams.get(cell.teamId) :
+        summary.eras.get(cell.era)) || empty;
+      const eligibleCount = summary.count - excluded.count;
+      if (!eligibleCount) return null;
+      const group = (scope === "team" ? summary.eras.get(cell.era) :
+        summary.teams.get(cell.teamId)) || empty;
+      const sameCell = summary.cells.get(`${cell.teamId}|${cell.era}`) || empty;
+      const global = (summary.sum - excluded.sum) / eligibleCount;
+      return (group.sum - sameCell.sum + 8 * global) /
+        (group.count - sameCell.count + 8);
     }
 
     state(mask, team, era) {
@@ -381,6 +403,206 @@
       }
       // With no known legal pick, an available retry is still the useful advice
       // even when there are no compatible historical samples for its scope.
+      if (!best && kind === "pick") kind = team ? "team" : era ? "era" : "dead";
+      return { kind, best, forecasts, sampleCount: this.pools.length };
+    }
+  }
+
+  // A family is an unsigned bitset of every feasible occupied-position mask.
+  // Adding a player's eligibility updates ALL legal roster assignments, not
+  // just the position at which the user happened to place that player.
+  function extendRosterFamily(family, eligibility) {
+    let result = 0;
+    for (let mask = 0; mask <= FULL_POSITION_MASK; mask += 1) {
+      if (!(family & (1 << mask))) continue;
+      for (let position = 0; position < 5; position += 1) {
+        const bit = 1 << position;
+        if (!(mask & bit) && (eligibility & bit)) result |= 1 << (mask | bit);
+      }
+    }
+    return result >>> 0;
+  }
+
+  function rosterFamily(rows) {
+    return (rows || []).reduce((family, row) =>
+      extendRosterFamily(family, row.posMask), 1);
+  }
+
+  class LiveDraftPlanner extends FixedSlotDraftPlanner {
+    constructor(pools, entries) {
+      super(pools, entries);
+      this.initialFamily = rosterFamily(this.fixed);
+      // Under this additive planning approximation, equal-eligibility players
+      // share a continuation. Keep the highest value per eligibility profile
+      // in each future pool; all live offered players are still evaluated.
+      this.profiles = this.pools.map((pool) => {
+        const strongest = new Map();
+        for (const row of pool.rows) {
+          const value = this.value(row);
+          if (!strongest.has(row.posMask) || strongest.get(row.posMask) < value)
+            strongest.set(row.posMask, value);
+        }
+        return [...strongest].map(([mask, value]) => ({ mask, value }));
+      });
+      this.transitionMemo = new Map();
+      this.tailMemo = new Map();
+      this.tailProfiles = this.fixed.length === 3 ? this.pools.map((pool) =>
+        Array.from({ length: 4 }, (_, incomingSignature) => {
+          const groups = new Map();
+          for (const row of pool.rows) {
+            const steals = Number(row.spg > 0);
+            const blocks = Number(row.bpg > 0);
+            const signature = steals | (blocks << 1);
+            const ks = this.fixed.filter((fixed) => fixed.spg > 0).length +
+              (incomingSignature & 1) + steals;
+            const kb = this.fixed.filter((fixed) => fixed.bpg > 0).length +
+              ((incomingSignature >> 1) & 1) + blocks;
+            const value = COEFF_PPG * row.ppg + COEFF_RPG * row.rpg +
+              COEFF_APG * row.apg + COEFF_SPG[ks] * row.spg + COEFF_BPG[kb] * row.bpg;
+            const key = `${row.posMask}:${signature}`;
+            const top = groups.get(key) || [];
+            top.push({ row, value });
+            top.sort((a, b) => b.value - a.value);
+            // The incoming player can eliminate one name; retaining the best
+            // two distinct names preserves the exact last-pick maximum.
+            const distinct = top.filter((entry, index) =>
+              top.findIndex((other) => other.row.player === entry.row.player) === index).slice(0, 2);
+            groups.set(key, distinct);
+          }
+          return [...groups.values()].flat().map((entry) => entry.row);
+        })) : null;
+    }
+
+    extend(family, eligibility) {
+      const key = `${family}:${eligibility}`;
+      if (!this.transitionMemo.has(key))
+        this.transitionMemo.set(key, extendRosterFamily(family, eligibility));
+      return this.transitionMemo.get(key);
+    }
+
+    tailCompletion(row, team, era) {
+      const key = JSON.stringify([row.player, row.posMask, row.ppg, row.rpg,
+        row.apg, row.spg, row.bpg, team, era]);
+      if (this.tailMemo.has(key)) return this.tailMemo.get(key);
+      const family = this.extend(this.initialFamily, row.posMask);
+      const fixed = [...this.fixed, row];
+      const offset = rawTeamScore(this.fixed);
+      const afterTeam = team ? this.tailCompletion(row, 0, era) : null;
+      const afterEra = era ? this.tailCompletion(row, team, 0) : null;
+      const base = team || era ? this.tailCompletion(row, 0, 0) : null;
+      const signature = Number(row.spg > 0) | (Number(row.bpg > 0) << 1);
+      const table = this.pools.map((pool, index) => {
+        let value = base ? base.table[index] : -25;
+        if (!base) for (const future of this.tailProfiles[index][signature]) {
+          if (future.player === row.player || !this.extend(family, future.posMask)) continue;
+          value = Math.max(value, rawTeamScore([...fixed, future]) - offset);
+        }
+        if (afterTeam) value = Math.max(value,
+          this.retryExpectation(afterTeam.table, pool, "team") ?? -Infinity);
+        if (afterEra) value = Math.max(value,
+          this.retryExpectation(afterEra.table, pool, "era") ?? -Infinity);
+        return value;
+      });
+      const result = { table, mean: table.reduce((sum, value) => sum + value, 0) /
+        Math.max(1, table.length) };
+      this.tailMemo.set(key, result);
+      return result;
+    }
+
+    state(family, team, era) {
+      if (family === (1 << FULL_POSITION_MASK) >>> 0)
+        return { mean: 0, table: this.pools.map(() => 0) };
+      const key = `${family}:${team}:${era}`;
+      if (this.memo.has(key)) return this.memo.get(key);
+      const afterTeam = team ? this.state(family, 0, era) : null;
+      const afterEra = era ? this.state(family, team, 0) : null;
+      if (this.fixed.length === 3 && family === this.initialFamily) {
+        // With two picks left, compare complete five-player scores directly:
+        // exact defense normalization and no reuse of the incoming player.
+        const table = this.pools.map((pool) => {
+          let value = -25;
+          for (const row of pool.rows) {
+            if (!this.extend(family, row.posMask)) continue;
+            value = Math.max(value, this.tailCompletion(row, team, era).mean);
+          }
+          if (afterTeam) value = Math.max(value,
+            this.retryExpectation(afterTeam.table, pool, "team") ?? -Infinity);
+          if (afterEra) value = Math.max(value,
+            this.retryExpectation(afterEra.table, pool, "era") ?? -Infinity);
+          return value;
+        });
+        const result = { table, mean: table.reduce((sum, value) => sum + value, 0) /
+          Math.max(1, table.length) };
+        this.memo.set(key, result);
+        return result;
+      }
+      const table = this.profiles.map((profiles, index) => {
+        let value = -25;
+        for (const profile of profiles) {
+          const next = this.extend(family, profile.mask);
+          if (!next) continue;
+          value = Math.max(value, profile.value + this.state(next, team, era).mean);
+        }
+        if (afterTeam) value = Math.max(value,
+          this.retryExpectation(afterTeam.table, this.pools[index], "team") ?? -Infinity);
+        if (afterEra) value = Math.max(value,
+          this.retryExpectation(afterEra.table, this.pools[index], "era") ?? -Infinity);
+        return value;
+      });
+      const result = { table, mean: table.reduce((sum, value) => sum + value, 0) /
+        Math.max(1, table.length) };
+      this.memo.set(key, result);
+      return result;
+    }
+
+    advise(rows, cell, retries) {
+      const states = reachableRosterStates(this.entries);
+      const used = new Set(this.fixed.map((row) => row.player));
+      const team = Number(Boolean(retries.team));
+      const era = Number(Boolean(retries.era));
+      let best = null;
+      for (const row of rows) {
+        if (used.has(row.player)) continue;
+        const next = this.extend(this.initialFamily, row.posMask);
+        if (!next) continue;
+        // Any incoming player may justify a move if the full team benefits.
+        // A shortest empty-slot route avoids unnecessary moves and swaps.
+        const plan = shortestPlacementPlan(states, row);
+        if (!plan) continue;
+        const value = this.fixed.length === 3 ? this.tailCompletion(row, team, era).mean :
+          this.value(row) + this.state(next, team, era).mean;
+        if (!best || value > best.value + EPSILON ||
+            (Math.abs(value - best.value) <= EPSILON && plan.moves.length < best.moves.length))
+          best = { row, ...plan, value, result: calculateTeamResult([...this.fixed, row]) };
+      }
+      if (best) {
+        // Equal-score arrangements differ only in how soon a later pick might
+        // need a move. Prefer a natural open slot without changing the player
+        // or sacrificing score, then show the shortest realizable route.
+        const placement = new FixedSlotDraftPlanner(this.pools, this.entries);
+        let ease = -Infinity;
+        for (const position of POSITIONS) {
+          const plan = shortestPlacementPlan(states, best.row, null, position);
+          if (!plan || plan.moves.length !== best.moves.length) continue;
+          const futureEase = placement.state(plan.postMask, team, era).mean;
+          if (futureEase > ease + EPSILON) {
+            ease = futureEase;
+            best = { ...best, ...plan };
+          }
+        }
+      }
+      const forecasts = {
+        team: team ? this.retryExpectation(this.state(this.initialFamily, 0, era).table, cell, "team") : null,
+        era: era ? this.retryExpectation(this.state(this.initialFamily, team, 0).table, cell, "era") : null,
+      };
+      let kind = "pick";
+      let value = best?.value ?? -Infinity;
+      for (const scope of ["team", "era"]) {
+        if (forecasts[scope] !== null && forecasts[scope] > value + EPSILON) {
+          kind = scope;
+          value = forecasts[scope];
+        }
+      }
       if (!best && kind === "pick") kind = team ? "team" : era ? "era" : "dead";
       return { kind, best, forecasts, sampleCount: this.pools.length };
     }
@@ -1340,6 +1562,9 @@
     bestLivePick,
     livePriorPools,
     LiveDraftPlanner,
+    FixedSlotDraftPlanner,
+    rosterFamily,
+    extendRosterFamily,
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
@@ -3678,7 +3903,8 @@
       <div class="row"><span>Players evaluated</span><strong>${rows.length}</strong></div>
       <div class="row"><span>Team retry</span><strong>${forecastText("team")}</strong></div>
       <div class="row"><span>Era retry</span><strong>${forecastText("era")}</strong></div>
-      <div class="row"><span>Method</span><strong>Position-aware dynamic programming</strong></div>
+      <div class="row"><span>Method</span><strong>Flexible-roster score planning</strong></div>
+      ${entries.length >= 3 ? '<div class="row"><span>Scoring</span><strong>Complete-team formula</strong></div>' : ""}
       <div class="row"><span>Planning samples</span><strong>${advice.sampleCount} team/era pools</strong></div>
       <div class="sub">Retry estimates use sampled rolls and your locally saved Classic stats. They are estimates, not guaranteed outcomes or proof of 82-0 feasibility.</div>
       </div>` : "";

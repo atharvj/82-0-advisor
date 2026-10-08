@@ -8,17 +8,19 @@ A userscript for [82-0](https://82-0.com/) that recommends the best player, exac
 2. Create a new userscript and paste in [`82-0-advisor.user.js`](./82-0-advisor.user.js).
 3. Save it, refresh 82-0, and start a new game.
 
-Version 2.5.0 supports the October 2026 API v4 update and restores **Team/Era retry recommendations**. The coach reads each live offer, recommends an actually available player and position, and waits on the home screen without a dataset timeout.
+Version 2.6.0 prioritizes **final team score with full roster-position flexibility** on the October 2026 API v4 site. The coach reads each live offer, recommends an actually available player and position, and compares free Team/Era retries.
 
-On v4, a finite-horizon dynamic program compares picking now, rerolling Team, and rerolling Era. It accounts for position scarcity, your existing picks, and saving a free retry for later. Future-roll estimates start with 69 anonymously observed team/era pools and incorporate Classic stats saved in your browser. Sparse Team/Era samples are smoothed toward the overall sample to limit overconfidence. The last pick uses the calculated completed-team score, including recorded-defense normalization.
+On v4, a finite-horizon dynamic program compares picking now, rerolling Team, and rerolling Era. Its state retains every legal occupied-position arrangement for the selected players, including hypothetical future selections. A PG/SG placed at PG therefore does not permanently block a future PG: the planner knows that player can move to SG. Future-roll estimates start with 69 anonymously observed team/era pools and incorporate Classic stats saved in your browser. Sparse Team/Era samples are smoothed toward the overall sample to limit overconfidence.
 
-These are **sample-based recommendations, not guaranteed optimal choices or guaranteed 82-0 runs**. The server hides future offers and the full current database, and its score-to-record conversion changed on v4. The coach therefore does not invent final-win forecasts or claim to prove 82-0 is impossible on v4. Planning approximates hypothetical future player collisions and moves; actual picks remain restricted to the live offer. Older dataset-based sites retain the previous optimizer.
+With two picks remaining, the planner evaluates completed five-player scores directly over sampled future offers, including exact recorded-defense normalization and excluding the current incoming player's name from the last offer. The last pick maximizes the calculated completed-team score across players who can fit after legal rearrangement. Early-round forecasts still approximate defensive-stat counts and hypothetical future player-name collisions.
+
+These are **sample-based recommendations, not guaranteed optimal choices or guaranteed 82-0 runs**. The server hides future offers and the full current database, and its score-to-record conversion changed on v4. The coach therefore does not invent final-win forecasts or claim to prove 82-0 is impossible on v4. Actual picks remain restricted to the live offer. Older dataset-based sites retain the previous optimizer.
 
 Hoop IQ now omits stats from its server responses. The coach saves stats encountered in Classic locally in your browser and uses them for matching Hoop IQ player/team/era cards. Unknown stats are clearly reported; a recommendation based on only part of an offer is labeled accordingly. No player data or history is uploaded.
 
 The coach is advisory only and panel-only: it reads the draft state but never outlines, relabels, disables, or otherwise modifies the website's player cards, positions, and retry buttons. All instructions appear in the side panel. Use the `⏻` button in its header to turn the coach off for as many games as you want; the small **Coach off** pill remains available to turn it back on.
 
-When a pick needs multiple lineup moves, the coach routes every move through the currently empty position and shows the rest of the sequence under the first instruction. It never begins with an occupied-position swap that can reverse on the next scan.
+When a pick needs multiple lineup moves, the coach routes every move through a currently empty position and shows the rest of the sequence under the first instruction. It never begins with an occupied-position swap. Following each instruction shortens the route to the same incoming player. A move no longer requires the incoming player to outscore the incumbent: improving the complete team is the priority. Equal-score routes prefer fewer moves and natural positions that reduce later reshuffling.
 
 Current v4 recommendations use the live offer directly and do not wait for a missing dataset. On older sites, animated dots beside **Analyzing the roll** show that the bounded rollout calculation is running.
 
@@ -42,4 +44,4 @@ Retry advice takes priority in the panel, in orange for Team and purple for Era.
 
 ## Validation
 
-Run `node tests/core.test.js` and `node tests/live-planner.bench.js`. The benchmark compares the previous greedy/no-retry policy against position/retry planning across 500 paired simulated drafts from captured rolls. It is a regression test of the sampled model, **not a real-game win-rate claim**. A live end-to-end Classic test also verified selectable recommendations, position tracking, a Team retry, and reading the site's final result.
+Run `node tests/core.test.js` and `node tests/live-planner.bench.js`. Tests compare compact roster eligibility with exhaustive assignment, exercise move-route progression, and check exact two-pick scoring and duplicate exclusion. The benchmark compares greedy/no-retry, v2.5 fixed-slot planning, and v2.6 flexible-roster planning across 500 paired simulated drafts from captured rolls. It is a regression test of the sampled model, **not a real-game win-rate claim**. Live Classic tests also verify selectable recommendations, position tracking, retries, and reading the site's final result.

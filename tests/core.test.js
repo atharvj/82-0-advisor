@@ -20,6 +20,9 @@ const {
   bestLivePick,
   livePriorPools,
   LiveDraftPlanner,
+  FixedSlotDraftPlanner,
+  rosterFamily,
+  extendRosterFamily,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -109,6 +112,148 @@ const unavailableStar = new LiveDraftPlanner(livePriorPools(), []).advise(
   { teamId: "351", era: "1970s" }, { team: false, era: false });
 assert.equal(unavailableStar.best.row.player, "Only offered player",
   "planning priors must never introduce a player outside the current offer");
+
+const flexData = normalizeDataset([
+  row("Existing guard", "AAA", "2020s", ["PG", "SG"], 35, 7, 8, 1, 0.5),
+  row("Existing PF", "AAA", "2020s", ["PF"], 20, 8, 3, 1, 1),
+  row("Existing C", "AAA", "2020s", ["C"], 20, 12, 2, 1, 2),
+  row("Strong SF", "BBB", "2020s", ["SF"], 25, 8, 5, 1, 1),
+  row("Weaker SG", "BBB", "2020s", ["SG"], 15, 3, 3, 1, 0.2),
+  row("Incoming PG", "CCC", "2020s", ["PG"], 15, 5, 5, 1, 0.2),
+  row("Weak SF", "CCC", "2020s", ["SF"], 5, 3, 1, 1, 0.2),
+]).rows;
+const flexEntries = flexData.slice(0, 3).map((candidate, index) =>
+  ({ row: candidate, position: ["PG", "PF", "C"][index] }));
+const futurePool = { teamId: "CCC", era: "2020s", rows: flexData.slice(5) };
+const currentPool = { teamId: "BBB", era: "2020s" };
+const noRetries = { team: false, era: false };
+assert.equal(new FixedSlotDraftPlanner([futurePool], flexEntries)
+  .advise(flexData.slice(3, 5), currentPool, noRetries).best.row.player, "Weaker SG");
+const flexibleChoice = new LiveDraftPlanner([futurePool], flexEntries)
+  .advise(flexData.slice(3, 5), currentPool, noRetries);
+assert.equal(flexibleChoice.best.row.player, "Strong SF",
+  "forecasts must know the existing guard can move to SG for a future PG");
+const fourFlexible = [...flexEntries, { row: flexibleChoice.best.row, position: "SF" }];
+const lastFlexible = new LiveDraftPlanner([futurePool], fourFlexible)
+  .advise(futurePool.rows, futurePool, noRetries);
+assert.equal(lastFlexible.best.row.player, "Incoming PG");
+assert.deepEqual(lastFlexible.best.moves,
+  [{ player: "Existing guard", from: "PG", to: "SG", swapPlayer: null }],
+  "a lower-scoring incoming guard must still fit when it benefits the whole team");
+fourFlexible[0].position = "SG";
+const afterMove = new LiveDraftPlanner([futurePool], fourFlexible)
+  .advise(futurePool.rows, futurePool, noRetries);
+assert.equal(afterMove.best.row.player, "Incoming PG");
+assert.equal(afterMove.best.moves.length, 0,
+  "after following a move, advice must progress to the pick, not reverse the move");
+assert.equal(afterMove.best.position, "PG");
+assert.equal(flexibleChoice.best.value,
+  calculateTeamResult([...flexEntries.map((entry) => entry.row), flexData[3], flexData[5]]).raw -
+    calculateTeamResult(flexEntries.map((entry) => entry.row)).raw,
+  "with two picks left, planning must use the actual completed-team formula");
+const duplicatePool = { ...futurePool, rows: [flexData[3], flexData[5]] };
+assert.equal(new LiveDraftPlanner([duplicatePool], flexEntries)
+  .advise([flexData[3]], currentPool, noRetries).best.value, flexibleChoice.best.value,
+  "two-pick forecasts must never reuse the player currently being recommended");
+
+// Compare compact eligibility families with exhaustive legal assignments.
+function exhaustiveFamily(players, index = 0, occupied = 0) {
+  if (index === players.length) return (1 << occupied) >>> 0;
+  let family = 0;
+  for (let position = 0; position < 5; position += 1) {
+    const bit = 1 << position;
+    if (!(occupied & bit) && (players[index].posMask & bit))
+      family |= exhaustiveFamily(players, index + 1, occupied | bit);
+  }
+  return family >>> 0;
+}
+const familyRng = new MulberryRng(820);
+for (let sample = 0; sample < 150; sample += 1) {
+  const players = [];
+  let family = 1;
+  for (let size = 0; size < 5; size += 1) {
+    const player = { posMask: 1 + Math.floor(familyRng.next() * 31) };
+    players.push(player);
+    family = extendRosterFamily(family, player.posMask);
+    assert.equal(family, exhaustiveFamily(players));
+    assert.equal(rosterFamily(players), family);
+  }
+}
+// Recompute after every user move, just as the live panel does. A route must
+// strictly shorten; it must never reverse or target an occupied destination.
+for (let sample = 0; sample < 100; sample += 1) {
+  const empty = sample % 5;
+  const entries = POSITIONS.flatMap((position, index) => index === empty ? [] : [{
+    position,
+    row: { player: `Move test ${index}`, posMask: (1 << index) |
+      (1 + Math.floor(familyRng.next() * 31)), ppg: 20, rpg: 5, apg: 3, spg: 1, bpg: 1 },
+  }]);
+  const incoming = { player: "Incoming", posMask: 1 + Math.floor(familyRng.next() * 31),
+    ppg: 15, rpg: 3, apg: 2, spg: 1, bpg: 1 };
+  let previousLength = Infinity;
+  for (let step = 0; step < 5; step += 1) {
+    const advice = new LiveDraftPlanner([], entries).advise([incoming], currentPool, noRetries);
+    if (!advice.best) {
+      assert.equal(rosterFamily([...entries.map((entry) => entry.row), incoming]), 0);
+      break;
+    }
+    assert.ok(advice.best.moves.length < previousLength, "move advice must not loop");
+    previousLength = advice.best.moves.length;
+    const move = advice.best.moves[0];
+    if (!move) {
+      assert.ok(!entries.some((entry) => entry.position === advice.best.position));
+      break;
+    }
+    assert.ok(!entries.some((entry) => entry.position === move.to));
+    const moving = entries.find((entry) => entry.row.player === move.player);
+    assert.equal(moving.position, move.from);
+    assert.ok(moving.row.posMask & (1 << POSITIONS.indexOf(move.to)));
+    moving.position = move.to;
+    assert.ok(step < 4, "a five-slot placement must finish within four moves");
+  }
+}
+const tailRng = new MulberryRng(261);
+const randomTailRow = (player) => ({ player,
+  posMask: 1 + Math.floor(tailRng.next() * 31),
+  ppg: tailRng.next() * 35, rpg: tailRng.next() * 16, apg: tailRng.next() * 12,
+  spg: tailRng.next() > 0.3 ? tailRng.next() * 3 : 0,
+  bpg: tailRng.next() > 0.3 ? tailRng.next() * 4 : 0,
+});
+const tailPools = Array.from({ length: 6 }, (_, index) => ({
+  teamId: `Tail ${index % 3}`, era: index < 3 ? "2000s" : "2010s",
+  rows: Array.from({ length: 20 }, (_, player) => randomTailRow(`Tail player ${index}:${player}`)),
+}));
+const tailPlanner = new LiveDraftPlanner(tailPools, flexEntries);
+for (let sample = 0; sample < 20; sample += 1) {
+  // Also exclude names that actually occur in a future offer.
+  const incoming = sample < 10 ? tailPools[sample % 6].rows[sample] : randomTailRow(`New ${sample}`);
+  if (!rosterFamily([...flexEntries.map((entry) => entry.row), incoming])) continue;
+  const used = new Set([...flexEntries.map((entry) => entry.row.player), incoming.player]);
+  const fixed = [...flexEntries.map((entry) => entry.row), incoming];
+  const offset = calculateTeamResult(flexEntries.map((entry) => entry.row)).raw;
+  const base = tailPools.map((pool) => Math.max(-25, ...pool.rows.filter((future) =>
+    !used.has(future.player) && rosterFamily([...fixed, future])).map((future) =>
+    calculateTeamResult([...fixed, future]).raw - offset)));
+  const expected = new Map();
+  for (const [team, era] of [[0, 0], [0, 1], [1, 0], [1, 1]]) {
+    const retryValue = (table, cell, scope) => {
+      const options = tailPools.map((pool, index) => ({ pool, value: table[index] }))
+        .filter(({ pool }) => scope === "team" ? pool.teamId !== cell.teamId : pool.era !== cell.era);
+      const conditional = options.filter(({ pool }) => scope === "team"
+        ? pool.era === cell.era : pool.teamId === cell.teamId);
+      const global = options.reduce((sum, entry) => sum + entry.value, 0) / options.length;
+      return (conditional.reduce((sum, entry) => sum + entry.value, 0) + 8 * global) /
+        (conditional.length + 8);
+    };
+    const table = base.map((value, index) => Math.max(value,
+      team ? retryValue(expected.get(`0:${era}`), tailPools[index], "team") : -Infinity,
+      era ? retryValue(expected.get(`${team}:0`), tailPools[index], "era") : -Infinity));
+    expected.set(`${team}:${era}`, table);
+    const actual = tailPlanner.tailCompletion(incoming, team, era).table;
+    actual.forEach((value, index) => assert.ok(Math.abs(value - table[index]) < 1e-8,
+      "optimized two-pick scoring must equal exhaustive scoring, including retries and duplicate names"));
+  }
+}
 // The older dataset-based release used this curve. v4 advice must not forecast
 // wins with it; live final records are read from the site instead.
 assert.equal(TARGET_SCORE, 109.5);
