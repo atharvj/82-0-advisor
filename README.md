@@ -8,7 +8,7 @@ A userscript for [82-0](https://82-0.com/) that recommends the best player, exac
 2. Create a new userscript and paste in [`82-0-advisor.user.js`](./82-0-advisor.user.js).
 3. Save it, refresh 82-0, and start a new game.
 
-Version 2.6.0 prioritizes **final team score with full roster-position flexibility** on the October 2026 API v4 site. The coach reads each live offer, recommends an actually available player and position, and compares free Team/Era retries.
+Version 2.6.1 prioritizes **final team score with full roster-position flexibility** on the October 2026 API v4 site. It also fixes jersey initials such as Paul George's “PG” being mistaken for his court position. Occupied jerseys remain tracked when selecting a player turns them into non-interactive elements, and advice is validated against the current lineup before displaying a pick.
 
 On v4, a finite-horizon dynamic program compares picking now, rerolling Team, and rerolling Era. Its state retains every legal occupied-position arrangement for the selected players, including hypothetical future selections. A PG/SG placed at PG therefore does not permanently block a future PG: the planner knows that player can move to SG. Future-roll estimates start with 69 anonymously observed team/era pools and incorporate Classic stats saved in your browser. Sparse Team/Era samples are smoothed toward the overall sample to limit overconfidence.
 

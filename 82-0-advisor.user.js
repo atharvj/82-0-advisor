@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.6.0
+// @version      2.6.1
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.6.0";
+  const VERSION = "2.6.1";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -1568,6 +1568,10 @@
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
+    controlPosition,
+    readCourtRoster,
+    placementPlanIsLegal,
+    lineupMatchesSnapshot,
     movePlanUpgradesOccupiedPosition,
     MulberryRng,
     buildStudioDrawIndex,
@@ -2543,38 +2547,52 @@
     return runtime.lastCell;
   }
 
-  function parseTray() {
-    const tray = document.querySelector("[data-lineup-tray]");
+  function readCourtRoster(root, knownNames = new Set(), trackedNames = []) {
+    const tray = root.querySelector("[data-lineup-tray]");
     const controls = new Set();
     if (tray) {
       for (const slot of tray.querySelectorAll('[role="button"]'))
         controls.add(slot);
     }
-    for (const slot of document.querySelectorAll(
+    for (const slot of root.querySelectorAll(
       'button[data-track-name="draft_slot_place"],[data-court-slot]',
     ))
       controls.add(slot);
-    if (!controls.size) return { present: false, slots: new Map() };
+    // After a player is selected, occupied/ineligible jerseys become static
+    // non-button elements. They still have authoritative position/name labels.
+    for (const slot of root.querySelectorAll('[aria-label]')) {
+      if (/^(PG|SG|SF|PF|C)(?:\s*:|$)/.test(slot.getAttribute("aria-label") || "") &&
+          slot.querySelector('[data-slot-figure]')) controls.add(slot);
+    }
+    if (!controls.size) return { present: false, complete: false, slots: new Map() };
     const slots = new Map();
+    const positions = new Set();
     for (const slot of controls) {
       const position = controlPosition(slot);
       if (!position) continue;
+      positions.add(position);
       let name = [...slot.querySelectorAll("p")]
         .map((element) => element.textContent.trim())
-        .find((text) => runtime.namesSet.has(text));
+        .find((text) => knownNames.has(text));
       if (!name) {
         const label = slot.getAttribute("aria-label") || "";
         const english = label.match(/^(PG|SG|SF|PF|C)\s*:\s*(.+?)(?:,|$)/);
-        if (english && runtime.namesSet.has(english[2])) name = english[2];
+        // An explicit occupied label is authoritative even if its player's
+        // stats are unknown. Unknown names must never make a slot look empty.
+        if (english) name = english[2].trim();
         if (!name) {
-          name = [...runtime.tracked.keys()].find((candidate) =>
+          name = trackedNames.find((candidate) =>
             label.includes(candidate),
           );
         }
       }
       if (name) slots.set(position, name);
     }
-    return { present: true, slots };
+    return { present: true, complete: positions.size === 5, slots };
+  }
+
+  function parseTray() {
+    return readCourtRoster(document, runtime.namesSet, [...runtime.tracked.keys()]);
   }
 
   function commitPendingPickIfNeeded(trayState, cell) {
@@ -2635,7 +2653,7 @@
     let changed = false;
     const visibleNames = new Set(trayState.slots.values());
     for (const name of [...runtime.tracked.keys()]) {
-      if (!visibleNames.has(name)) {
+      if (trayState.complete && !visibleNames.has(name)) {
         runtime.tracked.delete(name);
         changed = true;
       }
@@ -3825,24 +3843,54 @@
   }
 
   function controlPosition(element) {
-    const texts = [
-      element.getAttribute?.("aria-label") || "",
-      element.getAttribute?.("data-position") || "",
-      element.getAttribute?.("data-court-slot") || "",
-      element.getAttribute?.("data-tray-slot") || "",
-      ...[...(element.querySelectorAll?.("span") || [])].map((span) =>
-        span.textContent.trim(),
-      ),
-    ];
-    return (
-      POSITIONS.find((position) =>
-        texts.some(
-          (text) =>
-            text === position ||
-            new RegExp(`^${position}(?:\\s*:|\\b)`).test(text),
-        ),
-      ) || null
-    );
+    if (!element || element.matches?.('[data-testid="player-card"]')) return null;
+    // Read structural labels BEFORE any child text. Paul George's initials
+    // "PG" inside a PF jersey are a player label, not a position.
+    for (const key of ["data-position", "data-court-slot", "data-tray-slot", "aria-label"]) {
+      const text = String(element.getAttribute?.(key) || "").trim();
+      const match = text.match(/^(PG|SG|SF|PF|C)(?:\s*:|\b)/);
+      if (match) return match[1];
+    }
+    const caption = element.querySelector?.('[data-slot-caption]') ||
+      element.parentElement?.querySelector?.(':scope > [data-slot-caption]');
+    const captionText = caption?.textContent.trim();
+    if (POSITIONS.includes(captionText)) return captionText;
+    for (const span of element.querySelectorAll?.("span") || []) {
+      if (span.closest?.('[data-slot-garment]')) continue;
+      const text = span.textContent.trim();
+      if (POSITIONS.includes(text)) return text;
+    }
+    return null;
+  }
+
+  function lineupMatchesSnapshot(entries, snapshot) {
+    if (!snapshot.present || !snapshot.complete) return false;
+    if (entries.length !== snapshot.slots.size) return false;
+    return [...snapshot.slots].every(([position, player]) => entries.some((entry) =>
+      entry.position === position && entry.row.player === player));
+  }
+
+  function placementPlanIsLegal(entries, row, plan) {
+    if (!plan || !row) return false;
+    const slots = new Map();
+    const names = new Set();
+    for (const entry of entries) {
+      if (POSITION_INDEX[entry.position] === undefined || slots.has(entry.position) ||
+          names.has(entry.row.player) || !(entry.row.posMask & (1 << POSITION_INDEX[entry.position])))
+        return false;
+      slots.set(entry.position, entry.row);
+      names.add(entry.row.player);
+    }
+    if ([...slots.values()].some((picked) => picked.player === row.player)) return false;
+    for (const move of plan.moves || []) {
+      const moving = slots.get(move.from);
+      if (POSITION_INDEX[move.to] === undefined || !moving || moving.player !== move.player || slots.has(move.to) ||
+          !(moving.posMask & (1 << POSITION_INDEX[move.to]))) return false;
+      slots.delete(move.from);
+      slots.set(move.to, moving);
+    }
+    return POSITION_INDEX[plan.position] !== undefined && !slots.has(plan.position) &&
+      Boolean(row.posMask & (1 << POSITION_INDEX[plan.position]));
   }
 
   function scoreText(result) {
@@ -3869,6 +3917,13 @@
     }
     const advice = runtime.lastAnalysis;
     const best = advice.best;
+    if (best && !placementPlanIsLegal(entries, best.row, best)) {
+      runtime.lastAnalysisKey = "";
+      runtime.lastAnalysis = null;
+      renderLoading("Updating lineup…");
+      scheduleScan(120);
+      return;
+    }
     const isRetry = advice.kind === "team" || advice.kind === "era";
     const move = !isRetry && best?.moves[0];
     const color = isRetry ? COLORS[advice.kind] : move ? COLORS.position : best ? COLORS.pick : COLORS.team;
@@ -4629,6 +4684,13 @@
       renderLoading(runtime.liveDataMode
         ? "Stats for a selected player are unavailable. Play Classic to save stats for future Hoop IQ games."
         : "Syncing your previously selected peaks…");
+      return;
+    }
+    if (!lineupMatchesSnapshot(entries, trayState)) {
+      runtime.lastAnalysisKey = "";
+      runtime.lastAnalysis = null;
+      renderLoading("Updating lineup…");
+      scheduleScan(120);
       return;
     }
     const openMask = FULL_POSITION_MASK & ~occupiedMask(entries);

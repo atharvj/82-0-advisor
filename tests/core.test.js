@@ -25,6 +25,10 @@ const {
   extendRosterFamily,
   reachableRosterStates,
   shortestPlacementPlan,
+  controlPosition,
+  readCourtRoster,
+  placementPlanIsLegal,
+  lineupMatchesSnapshot,
   movePlanUpgradesOccupiedPosition,
   MulberryRng,
   buildStudioDrawIndex,
@@ -36,6 +40,63 @@ const {
 function row(player, team, era, positions, ppg, rpg, apg, spg, bpg) {
   return { player, team, era, positions, ppg, rpg, apg, spg, bpg };
 }
+
+function courtSlot(label, initials, active = true) {
+  return {
+    active,
+    getAttribute: (key) => key === "aria-label" ? label : null,
+    matches: () => false,
+    querySelector: (selector) => selector === "[data-slot-figure]" ? {} : null,
+    querySelectorAll: (selector) => selector === "span" && initials
+      ? [{ textContent: initials, closest: () => ({}) }] : [],
+  };
+}
+assert.equal(controlPosition(courtSlot("PF: Paul George", "PG")), "PF",
+  "Paul George's PG jersey initials must never override the authoritative PF label");
+assert.equal(controlPosition(courtSlot("SF: Shai Gilgeous-Alexander", "SG")), "SF");
+assert.equal(controlPosition({ matches: () => true }), null,
+  "clicking a player card must not count as clicking a position");
+const shownSlots = [courtSlot("PG"), courtSlot("SG: Donovan Mitchell", "DM"),
+  courtSlot("SF: Luka Dončić", "LD"), courtSlot("PF: Paul George", "PG"), courtSlot("C")];
+const fakeCourt = {
+  querySelector: () => null,
+  querySelectorAll: (selector) => selector === "[aria-label]" ? shownSlots :
+    shownSlots.filter((slot) => slot.active),
+};
+const beforeSelection = readCourtRoster(fakeCourt);
+assert.equal(beforeSelection.complete, true);
+assert.deepEqual([...beforeSelection.slots], [["SG", "Donovan Mitchell"],
+  ["SF", "Luka Dončić"], ["PF", "Paul George"]]);
+shownSlots.forEach((slot, index) => { slot.active = index === 4; });
+const afterSelection = readCourtRoster(fakeCourt);
+assert.deepEqual([...afterSelection.slots], [...beforeSelection.slots],
+  "occupied jerseys must remain readable when selecting a card makes them non-interactive");
+assert.equal(afterSelection.complete, true);
+assert.equal(controlPosition({
+  querySelectorAll: () => [{ textContent: "PG", closest: () => ({}) }],
+}), null, "jersey initials without a position label must never identify a slot");
+
+const screenshotRows = normalizeDataset([
+  row("Donovan Mitchell", "UTA", "2020s", ["PG", "SG"], 27, 5, 5, 1, 0.3),
+  row("Luka Dončić", "LAL", "2020s", ["PG", "SG", "SF"], 28, 8, 8, 1, 0.5),
+  row("Paul George", "LAC", "2020s", ["SG", "SF", "PF"], 24, 6, 4, 1, 0.5),
+  row("Elvin Hayes", "HOU", "1970s", ["PF", "C"], 27.1, 16, 2.5, 0, 0),
+]).rows;
+const screenshotEntries = screenshotRows.slice(0, 3).map((candidate, index) =>
+  ({ row: candidate, position: ["SG", "SF", "PF"][index] }));
+assert.equal(lineupMatchesSnapshot(screenshotEntries, afterSelection), true);
+assert.equal(lineupMatchesSnapshot(screenshotEntries, { ...afterSelection, complete: false }), false,
+  "an incomplete court snapshot must not approve a potentially stale pick instruction");
+assert.equal(lineupMatchesSnapshot(screenshotEntries.map((entry) => entry.row.player === "Paul George"
+  ? { ...entry, position: "PG" } : entry), afterSelection), false,
+  "stale or incorrectly inferred positions must be rejected before advice is displayed");
+assert.equal(placementPlanIsLegal(screenshotEntries, screenshotRows[3], { position: "PF", moves: [] }), false,
+  "Pick now must never direct a player into an occupied PF slot");
+const hayesAdvice = new LiveDraftPlanner(livePriorPools(), screenshotEntries)
+  .advise([screenshotRows[3]], { teamId: "350", era: "1970s" }, { team: false, era: false });
+assert.equal(hayesAdvice.best.position, "C", "Hayes belongs at the open C slot in this lineup");
+assert.equal(hayesAdvice.best.moves.length, 0);
+assert.equal(placementPlanIsLegal(screenshotEntries, screenshotRows[3], hayesAdvice.best), true);
 
 const v4Cell = normalizeDealtCell({
   seq: 0, era: "1970s",
