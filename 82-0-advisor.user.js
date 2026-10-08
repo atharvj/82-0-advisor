@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.6.1
+// @version      2.7.0
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.6.1";
+  const VERSION = "2.7.0";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -1543,6 +1543,34 @@
     }
   }
 
+  // Use the very same planner definitions in the worker, not a second model
+  // or a smaller search. Kept pure so parity can be tested outside the browser.
+  function livePlannerWorkerSource() {
+    const constants = { POSITIONS, POSITION_INDEX, FULL_POSITION_MASK, EPSILON,
+      RECORD_SCORE_CAP, COEFF_PPG, COEFF_RPG, COEFF_APG, COEFF_SPG, COEFF_BPG };
+    const definitions = [finiteNumber, positiveNumber, roundOne, rawTeamScore,
+      projectedWins, calculateTeamResult, rolloutRowValue, rosterStateKey,
+      reachableRosterStates, shortestPlacementPlan, movePlanUpgradesOccupiedPosition,
+      extendRosterFamily, rosterFamily, FixedSlotDraftPlanner, LiveDraftPlanner];
+    return `"use strict";\n${Object.entries(constants).map(([key, value]) =>
+      `const ${key} = ${JSON.stringify(value)};`).join("\n")}\n` +
+      definitions.map((definition) => definition.toString()).join("\n") + `
+      self.onmessage = ({ data }) => {
+        try {
+          const { pools, entries, rows, cell, retries } = data;
+          self.postMessage({ advice: new LiveDraftPlanner(pools, entries).advise(rows, cell, retries) });
+        } catch (error) {
+          self.postMessage({ error: String(error?.message || error) });
+        }
+      };`;
+  }
+
+  function clampPanelPosition(position, viewportWidth, viewportHeight, width, height) {
+    const clamp = (value, maximum) => Math.min(Math.max(8, finiteNumber(value)), Math.max(8, maximum));
+    return { x: clamp(position.x, viewportWidth - width - 8),
+      y: clamp(position.y, viewportHeight - height - 8) };
+  }
+
   const Core = {
     POSITIONS,
     TARGET_SCORE,
@@ -1562,6 +1590,8 @@
     bestLivePick,
     livePriorPools,
     LiveDraftPlanner,
+    livePlannerWorkerSource,
+    clampPanelPosition,
     FixedSlotDraftPlanner,
     rosterFamily,
     extendRosterFamily,
@@ -1701,6 +1731,11 @@
     lastAnalysis: null,
     analysisInProgressKey: "",
     analysisGeneration: 0,
+    liveAnalysisJob: null,
+    liveWorkerSource: null,
+    popupWindow: null,
+    popupHost: null,
+    popupPoll: 0,
     persistedPicks: new Map(),
     pickOrder: 0,
     emptyTraySince: 0,
@@ -1791,6 +1826,7 @@
         collapsed: false,
         details: false,
         hidden: false,
+        position: null,
         ...JSON.parse(localStorage.getItem(UI_KEY) || "{}"),
       };
     } catch (_) {
@@ -1799,6 +1835,7 @@
         collapsed: false,
         details: false,
         hidden: false,
+        position: null,
       };
     }
   }
@@ -1905,7 +1942,11 @@
         #card { width:min(292px,calc(100vw - 20px)); color:#e5edf6; background:rgba(5,12,23,.965); border:1px solid #26364c; border-radius:14px; box-shadow:0 14px 38px rgba(0,0,0,.55); font:12px/1.35 system-ui,-apple-system,sans-serif; overflow:hidden; backdrop-filter:blur(12px); }
         #card.hidden { width:auto; border-radius:999px; }
         #card.disabled { width:auto; border-radius:999px; border-color:#374151; }
-        header { height:34px; padding:0 8px 0 11px; display:flex; align-items:center; gap:7px; border-bottom:1px solid #1b293b; user-select:none; }
+        header { height:34px; padding:0 6px 0 9px; display:flex; align-items:center; gap:3px; border-bottom:1px solid #1b293b; user-select:none; cursor:grab; touch-action:none; }
+        header.dragging { cursor:grabbing; }
+        #card.detached { width:auto; border-radius:999px; }
+        #card.detached main, #card.detached .mode, #card.detached .logo, #card.detached #collapse, #card.detached #hide { display:none; }
+        #card.detached header { border:0; }
         #card.hidden header { border:0; padding:0 6px 0 10px; }
         #card.disabled header { border:0; padding:0 6px 0 10px; }
         #card.disabled main,
@@ -1916,11 +1957,13 @@
         #card.disabled .title { color:#94a3b8; }
         #card.disabled #power { color:#4ade80; background:#10271c; }
         .logo { font-size:14px; }
-        .title { font-size:10px; font-weight:900; letter-spacing:.08em; text-transform:uppercase; color:#9fb0c4; flex:1; white-space:nowrap; }
+        .title { font-size:10px; font-weight:900; letter-spacing:.08em; text-transform:uppercase; color:#9fb0c4; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .mode { color:#64748b; font-size:9px; font-weight:800; }
-        .icon { border:0; background:transparent; color:#7f93aa; width:23px; height:23px; border-radius:7px; cursor:pointer; padding:0; }
+        .icon { border:0; background:transparent; color:#7f93aa; width:23px; height:23px; flex:0 0 23px; border-radius:7px; cursor:pointer; padding:0; }
         .icon:hover { color:#fff; background:#1d2a3c; }
-        main { padding:10px; }
+        main { padding:10px; max-height:calc(100vh - 60px); overflow:auto; }
+        #window-note { color:#fcd34d; font-size:10px; padding:0 10px 7px; }
+        #window-note:empty { display:none; }
         #card.collapsed main { display:none; }
         .status { display:flex; align-items:center; gap:7px; margin-bottom:7px; color:#aab8c8; font-size:10px; }
         .dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:var(--status,#38bdf8); box-shadow:0 0 9px var(--status,#38bdf8); }
@@ -1961,6 +2004,7 @@
           #card { width:min(238px,calc(100vw - 16px)); }
           :host { right:8px; bottom:calc(88px + env(safe-area-inset-bottom)); }
           header { height:30px; }
+          .mode { display:none; }
           main { padding:6px; }
           .status { margin-bottom:3px; font-size:9px; line-height:1.15; }
           .action { padding:5px 7px; }
@@ -1972,44 +2016,56 @@
         }
         @media (prefers-reduced-motion:reduce) { * { animation:none !important; transition:none !important; } }
       </style>
-      <div id="card"><header><span class="logo">🏀</span><span class="title">82-0 Coach</span><span class="mode"></span><button class="icon" id="power" title="Turn coach off">⏻</button><button class="icon" id="collapse" title="Collapse">—</button><button class="icon" id="hide" title="Hide (Alt+A restores)">×</button></header><main id="content" role="status" aria-live="polite" aria-atomic="true"></main></div>
+      <div id="card"><header><span class="logo">🏀</span><span class="title">82-0 Coach</span><span class="mode"></span><button class="icon" id="power" title="Turn coach off">⏻</button><button class="icon" id="home" title="Return coach to its default corner">↩</button><button class="icon" id="popout" title="Open coach in a separate window">↗</button><button class="icon" id="collapse" title="Collapse">—</button><button class="icon" id="hide" title="Hide (Alt+A restores)">×</button></header><main id="content" role="status" aria-live="polite" aria-atomic="true"></main><div id="window-note" role="status"></div></div>
     `;
     document.body.appendChild(host);
 
+    bindPanelControls(host);
+    syncPanelState();
+    applyPanelPosition(host, readUiState().position);
+    bindPanelDragging(host);
+    window.addEventListener("resize", () => applyPanelPosition(host, readUiState().position));
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(() => applyPanelPosition(host, readUiState().position)).observe(host);
+    }
+    return host;
+  }
+
+  function syncPanelState() {
     const state = readUiState();
-    const card = shadow.getElementById("card");
-    card.classList.toggle("collapsed", state.collapsed);
-    card.classList.toggle("hidden", state.hidden);
-    card.classList.toggle("disabled", !state.enabled);
-    card.classList.toggle("details-open", state.details);
-    shadow.querySelector(".title").textContent = state.enabled
-      ? "82-0 Coach"
-      : "Coach off";
-    shadow.getElementById("power").title = state.enabled
-      ? "Turn coach off"
-      : "Turn coach on";
-    shadow.getElementById("collapse").textContent = state.collapsed ? "+" : "—";
+    for (const host of [document.getElementById(PANEL_ID), runtime.popupHost]) {
+      if (!host) continue;
+      const shadow = host.shadowRoot;
+      const detached = host === document.getElementById(PANEL_ID) && Boolean(runtime.popupHost);
+      const card = shadow.getElementById("card");
+      for (const [name, value] of Object.entries({ collapsed: state.collapsed,
+        hidden: state.hidden, disabled: !state.enabled, "details-open": state.details, detached }))
+        card.classList.toggle(name, value);
+      shadow.querySelector(".title").textContent = !state.enabled ? "Coach off" : detached ? "Coach window" : "82-0 Coach";
+      shadow.querySelector(".mode").textContent = modeLabel();
+      shadow.getElementById("power").title = state.enabled ? "Turn coach off" : "Turn coach on";
+      shadow.getElementById("collapse").textContent = state.collapsed ? "+" : "—";
+      shadow.getElementById("home").title = runtime.popupHost ? "Dock coach back in the default corner" : "Return coach to its default corner";
+      for (const button of shadow.querySelectorAll("header button"))
+        button.setAttribute("aria-label", button.title);
+    }
+  }
+
+  function bindPanelControls(host) {
+    const shadow = host.shadowRoot;
     shadow.getElementById("collapse").onclick = () => {
       const current = readUiState();
       current.collapsed = !current.collapsed;
       current.hidden = false;
       writeUiState(current);
-      card.classList.toggle("collapsed", current.collapsed);
-      card.classList.remove("hidden");
-      shadow.getElementById("collapse").textContent = current.collapsed
-        ? "+"
-        : "—";
+      syncPanelState();
     };
     shadow.getElementById("hide").onclick = () => {
       const current = readUiState();
       current.hidden = !current.hidden;
       current.collapsed = current.hidden ? true : current.collapsed;
       writeUiState(current);
-      card.classList.toggle("hidden", current.hidden);
-      card.classList.toggle("collapsed", current.collapsed);
-      shadow.getElementById("collapse").textContent = current.collapsed
-        ? "+"
-        : "—";
+      syncPanelState();
     };
     shadow.getElementById("power").onclick = () => {
       const current = readUiState();
@@ -2017,20 +2073,131 @@
       current.hidden = false;
       current.collapsed = false;
       writeUiState(current);
-      card.classList.toggle("disabled", !current.enabled);
-      card.classList.remove("hidden", "collapsed");
-      shadow.querySelector(".title").textContent = current.enabled
-        ? "82-0 Coach"
-        : "Coach off";
-      shadow.getElementById("power").title = current.enabled
-        ? "Turn coach off"
-        : "Turn coach on";
+      syncPanelState();
       clearHighlights();
       runtime.lastAdviceSignature = "";
-      if (!current.enabled) runtime.analysisInProgressKey = "";
+      if (current.enabled && runtime.lastAnalysis?.error) {
+        runtime.lastAnalysis = null;
+        runtime.lastAnalysisKey = "";
+      }
+      if (!current.enabled) {
+        cancelLiveAnalysis();
+        runtime.analysisInProgressKey = "";
+      }
       if (current.enabled) scheduleScan(0);
     };
-    return host;
+    shadow.getElementById("home").onclick = () => {
+      closeCoachWindow();
+      writeUiState({ ...readUiState(), position: null, hidden: false, collapsed: false });
+      applyPanelPosition(getPanel(), null);
+      syncPanelState();
+    };
+    shadow.getElementById("popout").onclick = openCoachWindow;
+  }
+
+  function applyPanelPosition(host, position) {
+    if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y)) {
+      for (const property of ["left", "top", "right", "bottom"]) host.style.removeProperty(property);
+      return;
+    }
+    const rect = host.getBoundingClientRect();
+    const clamped = clampPanelPosition(position, window.innerWidth, window.innerHeight, rect.width, rect.height);
+    Object.assign(host.style, { left: `${clamped.x}px`, top: `${clamped.y}px`, right: "auto", bottom: "auto" });
+  }
+
+  function bindPanelDragging(host) {
+    const header = host.shadowRoot.querySelector("header");
+    let drag = null;
+    header.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.target.closest("button")) return;
+      const rect = host.getBoundingClientRect();
+      drag = { id: event.pointerId, x: event.clientX - rect.left, y: event.clientY - rect.top };
+      header.setPointerCapture(event.pointerId);
+      header.classList.add("dragging");
+      event.preventDefault();
+    });
+    header.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      applyPanelPosition(host, { x: event.clientX - drag.x, y: event.clientY - drag.y });
+    });
+    const finish = (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const rect = host.getBoundingClientRect();
+      writeUiState({ ...readUiState(), position: { x: rect.left, y: rect.top } });
+      drag = null;
+      header.classList.remove("dragging");
+      if (header.hasPointerCapture(event.pointerId)) header.releasePointerCapture(event.pointerId);
+    };
+    header.addEventListener("pointerup", finish);
+    header.addEventListener("pointercancel", finish);
+    header.addEventListener("lostpointercapture", finish);
+  }
+
+  function closeCoachWindow() {
+    const popup = runtime.popupWindow;
+    runtime.popupWindow = null;
+    runtime.popupHost = null;
+    clearInterval(runtime.popupPoll);
+    runtime.popupPoll = 0;
+    if (popup && !popup.closed) {
+      try { if (popup.location.href === "about:blank") popup.close(); } catch (_) {}
+    }
+    syncPanelState();
+  }
+
+  function openCoachWindow() {
+    const host = getPanel();
+    const note = host.shadowRoot.getElementById("window-note");
+    note.textContent = "";
+    if (runtime.popupWindow && !runtime.popupWindow.closed) {
+      try { runtime.popupWindow.focus(); return; } catch (_) { closeCoachWindow(); }
+    }
+    if (runtime.popupWindow) closeCoachWindow();
+    let popup = null;
+    try { popup = window.open("", "_blank", "popup,width=360,height=520,resizable=yes,scrollbars=yes"); }
+    catch (_) {}
+    if (!popup) {
+      note.textContent = "Allow pop-ups for 82-0 to open the coach window.";
+      return;
+    }
+    try {
+      popup.document.title = "82-0 Coach";
+      Object.assign(popup.document.body.style, { margin: "0", background: "#050c17", colorScheme: "dark" });
+      const popupHost = popup.document.createElement("div");
+      popupHost.attachShadow({ mode: "open" }).innerHTML = host.shadowRoot.innerHTML;
+      const style = popup.document.createElement("style");
+      style.textContent = ":host {position:static;display:block;} #card {width:100%;border:0;border-radius:0;backdrop-filter:none;} header {cursor:default;} main {max-height:calc(100vh - 40px);} #popout {display:none;}";
+      popupHost.shadowRoot.appendChild(style);
+      popup.document.body.appendChild(popupHost);
+      runtime.popupWindow = popup;
+      runtime.popupHost = popupHost;
+      bindPanelControls(popupHost);
+      bindDetailsToggle(popupHost);
+      writeUiState({ ...readUiState(), hidden: false, collapsed: false });
+      const restore = () => { if (runtime.popupWindow === popup) closeCoachWindow(); };
+      popup.addEventListener("pagehide", restore, { once: true });
+      popup.document.addEventListener("keydown", handleKeydown, true);
+      runtime.popupPoll = window.setInterval(() => {
+        try { if (popup.closed || popup.location.href !== "about:blank") restore(); }
+        catch (_) { restore(); }
+      }, 1000);
+      syncPanelState();
+    } catch (_) {
+      popup.close();
+      closeCoachWindow();
+      note.textContent = "Could not open the coach window. The page panel is still available.";
+    }
+  }
+
+  function bindDetailsToggle(host) {
+    const detailsButton = host.shadowRoot.getElementById("details-toggle");
+    if (!detailsButton) return;
+    detailsButton.onclick = () => {
+      writeUiState({ ...readUiState(), details: !readUiState().details });
+      runtime.lastAdviceSignature = "";
+      syncPanelState();
+      scheduleScan(0);
+    };
   }
 
   function modeLabel() {
@@ -2118,6 +2285,7 @@
 
   function captureDealtSession(payload, isV4 = false) {
     if (!payload?.session_id || !Array.isArray(payload.slots)) return;
+    cancelLiveAnalysis();
     const sessionId = String(payload.session_id);
     const opponent = opponentFromSessionPayload(payload);
     if (opponent) setMode("1v1");
@@ -2151,6 +2319,7 @@
     const cell = isV4 ? normalizeDealtCell(payload?.cell) : payload?.cell;
     if (!cell || !Number.isFinite(Number(cell.seq)) || !cell.team ||
         !ERAS.has(cell.era) || !Array.isArray(cell.squad)) return;
+    cancelLiveAnalysis();
     if (isV4) {
       runtime.liveDataMode = true;
       runtime.dataReady = true;
@@ -2349,23 +2518,15 @@
   function renderPanel(html, signature) {
     const host = getPanel();
     const shadow = host.shadowRoot;
-    shadow.querySelector(".mode").textContent = modeLabel();
-    shadow
-      .getElementById("card")
-      .classList.toggle("details-open", readUiState().details);
+    syncPanelState();
     if (runtime.lastAdviceSignature === signature) return;
     runtime.lastAdviceSignature = signature;
     shadow.getElementById("content").innerHTML = html;
 
-    const detailsButton = shadow.getElementById("details-toggle");
-    if (detailsButton) {
-      detailsButton.onclick = () => {
-        const state = readUiState();
-        state.details = !state.details;
-        writeUiState(state);
-        runtime.lastAdviceSignature = "";
-        scheduleScan(0);
-      };
+    bindDetailsToggle(host);
+    if (runtime.popupHost) {
+      runtime.popupHost.shadowRoot.getElementById("content").innerHTML = html;
+      bindDetailsToggle(runtime.popupHost);
     }
   }
 
@@ -3897,6 +4058,60 @@
     return `${result.score.toFixed(1)} · ${result.wins}-${result.losses}`;
   }
 
+  function cancelLiveAnalysis() {
+    const job = runtime.liveAnalysisJob;
+    if (!job) return;
+    runtime.liveAnalysisJob = null;
+    job.worker?.terminate();
+    if (job.url) URL.revokeObjectURL(job.url);
+    clearTimeout(job.timer);
+    runtime.analysisInProgressKey = "";
+  }
+
+  function requestLiveAnalysis(key, input) {
+    if (runtime.liveAnalysisJob?.key === key) return;
+    cancelLiveAnalysis();
+    const job = { key, generation: runtime.analysisGeneration, worker: null, url: null, timer: 0 };
+    runtime.liveAnalysisJob = job;
+    runtime.analysisInProgressKey = key;
+    const isCurrent = () => runtime.liveAnalysisJob === job &&
+      runtime.analysisGeneration === job.generation && readUiState().enabled;
+    const finish = (message) => {
+      if (!isCurrent()) return;
+      cancelLiveAnalysis();
+      runtime.lastAnalysisKey = key;
+      runtime.lastAnalysis = message.advice ? { live: true, ...message.advice } :
+        { live: true, error: message.error || "Calculation failed. Turn the coach off and on to retry." };
+      scheduleScan(0);
+    };
+    // A browser/CSP that disallows workers gets the unchanged full planner.
+    // Yield first so the status can paint; never shrink the model for speed.
+    const fallback = () => {
+      if (!isCurrent() || job.fallback) return;
+      job.fallback = true;
+      job.worker?.terminate();
+      job.worker = null;
+      if (job.url) URL.revokeObjectURL(job.url);
+      job.url = null;
+      job.timer = window.setTimeout(() => {
+        if (!isCurrent()) return;
+        try {
+          finish({ advice: new LiveDraftPlanner(input.pools, input.entries)
+            .advise(input.rows, input.cell, input.retries) });
+        } catch (error) { finish({ error: String(error?.message || error) }); }
+      }, 32);
+    };
+    try {
+      runtime.liveWorkerSource ||= livePlannerWorkerSource();
+      job.url = URL.createObjectURL(new Blob([runtime.liveWorkerSource], { type: "text/javascript" }));
+      job.worker = new Worker(job.url, { name: "82-0 Coach planner" });
+      job.worker.onmessage = ({ data }) => finish(data);
+      job.worker.onerror = (event) => { event.preventDefault(); fallback(); };
+      job.worker.onmessageerror = fallback;
+      job.worker.postMessage(input);
+    } catch (_) { fallback(); }
+  }
+
   function renderLiveAdvice(cell, entries, retries) {
     const rows = currentRowsForCell(cell);
     const missing = (runtime.dealtCell?.squad.length || 0) - rows.length;
@@ -3910,12 +4125,15 @@
       entries.map((entry) => [entry.row.key, entry.position]), available,
       rows.map((row) => row.key), runtime.rows.length]);
     if (runtime.lastAnalysisKey !== analysisKey || !runtime.lastAnalysis?.live) {
-      const planner = new LiveDraftPlanner(livePlanningPools(), entries);
-      runtime.lastAnalysis = { live: true, ...planner.advise(rows,
-        { teamId: runtime.dealtCell?.teamId || cell.team, era: cell.era }, available) };
-      runtime.lastAnalysisKey = analysisKey;
+      renderAnalyzing();
+      if (runtime.liveAnalysisJob?.key !== analysisKey) requestLiveAnalysis(analysisKey, {
+        pools: livePlanningPools(), entries, rows,
+        cell: { teamId: runtime.dealtCell?.teamId || cell.team, era: cell.era }, retries: available,
+      });
+      return;
     }
     const advice = runtime.lastAnalysis;
+    if (advice.error) { renderLoading(`Could not analyze this roll: ${advice.error}`, true); return; }
     const best = advice.best;
     if (best && !placementPlanIsLegal(entries, best.row, best)) {
       runtime.lastAnalysisKey = "";
@@ -4454,6 +4672,7 @@
   }
 
   function resetRuntime(mode) {
+    cancelLiveAnalysis();
     runtime.tracked.clear();
     runtime.lastOffers.clear();
     runtime.recentOffers.clear();
@@ -4598,14 +4817,8 @@
       state.hidden = false;
       state.collapsed = !state.collapsed;
       writeUiState(state);
-      const host = getPanel();
-      host.shadowRoot.getElementById("card").classList.toggle("hidden", false);
-      host.shadowRoot
-        .getElementById("card")
-        .classList.toggle("collapsed", state.collapsed);
-      host.shadowRoot.getElementById("collapse").textContent = state.collapsed
-        ? "+"
-        : "—";
+      getPanel();
+      syncPanelState();
       event.preventDefault();
     }
   }
@@ -4630,13 +4843,15 @@
     const cell = parseCell(cards);
     const trayState = reconcileRoster(cell);
     if (!readUiState().enabled) {
+      cancelLiveAnalysis();
       clearHighlights();
       runtime.lastAdvice = null;
       runtime.analysisInProgressKey = "";
       return;
     }
-    if (renderResultsIfPresent()) return;
+    if (renderResultsIfPresent()) { cancelLiveAnalysis(); return; }
     if (!cell || !getPlayerListRoot() || !trayState.present) {
+      cancelLiveAnalysis();
       clearHighlights();
       const waiting = /spinning|respinning/i.test(
         document.body?.innerText || "",
@@ -4681,12 +4896,14 @@
 
     const entries = currentEntries(trayState);
     if (entries.length < trayState.slots.size) {
+      cancelLiveAnalysis();
       renderLoading(runtime.liveDataMode
         ? "Stats for a selected player are unavailable. Play Classic to save stats for future Hoop IQ games."
         : "Syncing your previously selected peaks…");
       return;
     }
     if (!lineupMatchesSnapshot(entries, trayState)) {
+      cancelLiveAnalysis();
       runtime.lastAnalysisKey = "";
       runtime.lastAnalysis = null;
       renderLoading("Updating lineup…");
@@ -4694,7 +4911,7 @@
       return;
     }
     const openMask = FULL_POSITION_MASK & ~occupiedMask(entries);
-    if (!openMask) return;
+    if (!openMask) { cancelLiveAnalysis(); return; }
 
     const retries = findRetryButtons();
     if (runtime.liveDataMode) {
@@ -4911,6 +5128,8 @@
 
   function bootstrap() {
     getPanel();
+    window.addEventListener("pagehide", () => { cancelLiveAnalysis(); closeCoachWindow(); });
+    window.addEventListener("pageshow", (event) => { if (event.persisted) scheduleScan(0); });
     document.addEventListener("click", handleDocumentClick, true);
     document.addEventListener("dragstart", handleDragStart, true);
     document.addEventListener("drop", handleDrop, true);
