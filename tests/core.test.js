@@ -18,6 +18,8 @@ const {
   resolveSquadRows,
   normalizeDealtCell,
   bestLivePick,
+  livePriorPools,
+  LiveDraftPlanner,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -66,12 +68,55 @@ assert.equal(lastChoice.row.player, "Rebounder",
 assert.equal(lastChoice.result.raw, Math.max(...lastPickData.rows.slice(4).map((candidate) =>
   calculateTeamResult([...lastEntries.map((entry) => entry.row), candidate]).raw)));
 
+const planningRows = normalizeDataset([
+  row("Weak", "AAA", "2020s", ["C"], 2, 1, 0, 0, 0),
+  row("Strong", "BBB", "2020s", ["C"], 35, 16, 6, 2, 4),
+]).rows;
+const weakPool = { teamId: "AAA", era: "2020s", rows: [planningRows[0]] };
+const strongPool = { teamId: "BBB", era: "2020s", rows: [planningRows[1]] };
+const retryPlanner = new LiveDraftPlanner([weakPool, strongPool], lastEntries);
+assert.equal(retryPlanner.advise(weakPool.rows, weakPool, { team: true, era: false }).kind,
+  "team", "a weak last pick must trigger a beneficial Team retry");
+assert.equal(retryPlanner.advise(weakPool.rows, weakPool, { team: false, era: false }).kind,
+  "pick", "used or non-free retries must never be recommended");
+assert.equal(retryPlanner.advise(strongPool.rows, strongPool, { team: true, era: false }).kind,
+  "pick", "keep a strong roll rather than spend a retry just because it exists");
+const differentEra = { ...strongPool, teamId: "AAA", era: "2010s" };
+assert.equal(new LiveDraftPlanner([weakPool, differentEra], lastEntries)
+  .advise(weakPool.rows, weakPool, { team: false, era: true }).kind,
+  "era", "a weak offer must trigger a beneficial Era retry for that franchise");
+assert.equal(retryPlanner.advise([], weakPool, { team: true, era: false }).kind,
+  "team", "a roll with no known legal pick must still offer retry guidance");
+assert.equal(retryPlanner.advise([], weakPool, { team: false, era: false }).kind,
+  "dead", "no pick and no retry must not fabricate an action");
+const lastPlanned = new LiveDraftPlanner(livePriorPools(), lastEntries)
+  .advise(lastPickData.rows.slice(4), weakPool, { team: false, era: false });
+assert.equal(lastPlanned.best.row.player, lastChoice.row.player,
+  "planning must retain exact completed-team scoring on the last pick");
+const positionRows = normalizeDataset([
+  row("Flexible Guard", "AAA", "2020s", ["PG", "SG"], 22, 5, 7, 1, 0.2),
+  row("Elite PG", "BBB", "2020s", ["PG"], 30, 10, 12, 2, 0.5),
+  row("Weak SG", "BBB", "2020s", ["SG"], 5, 1, 0, 0.1, 0),
+]).rows;
+const frontcourt = lastEntries.slice(2).concat([{ row: planningRows[1], position: "C" }]);
+assert.equal(new LiveDraftPlanner([
+  { teamId: "BBB", era: "2020s", rows: positionRows.slice(1) },
+], frontcourt).advise([positionRows[0]], weakPool, { team: false, era: false }).best.position,
+"SG", "a flexible guard should leave the more valuable future PG slot open");
+const unavailableStar = new LiveDraftPlanner(livePriorPools(), []).advise(
+  normalizeDataset([row("Only offered player", "IND", "1970s", ["SF"],
+    20, 8, 3, 1, 0.2)]).rows,
+  { teamId: "351", era: "1970s" }, { team: false, era: false });
+assert.equal(unavailableStar.best.row.player, "Only offered player",
+  "planning priors must never introduce a player outside the current offer");
+// The older dataset-based release used this curve. v4 advice must not forecast
+// wins with it; live final records are read from the site instead.
 assert.equal(TARGET_SCORE, 109.5);
 assert.equal(projectedWins(109.4), 81, "109.4 must remain an 81-win score");
 assert.equal(
   projectedWins(109.5),
   82,
-  "109.5 is the first displayed 82-win score",
+  "109.5 is the legacy curve's first displayed 82-win score",
 );
 assert.equal(
   projectedWins(91.3),
@@ -81,7 +126,7 @@ assert.equal(
 assert.equal(
   projectedWins(98),
   72,
-  "planning curve must match the signed-in result shown by the site",
+  "legacy planning curve must match the older result-screen regression",
 );
 
 assert.equal(
