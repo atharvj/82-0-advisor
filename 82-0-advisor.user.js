@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.3.1
+// @version      2.4.0
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,10 +14,11 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.3.1";
+  const VERSION = "2.4.0";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
+  const LIVE_ROWS_KEY = "__82coach_live_rows_v4__";
   const UI_KEY = "__82coach_ui_v1__";
   const MODE_KEY = "__82coach_mode_v1__";
   const MISMATCH_KEY = "__82coach_model_mismatch_v1__";
@@ -125,7 +126,7 @@
     const rows = [];
     const seen = new Set();
     for (const player of squad) {
-      const id = player?.player_id ?? player?.id;
+      const id = player?.id ?? player?.player_id;
       let row =
         id !== undefined && id !== null ? byId.get(String(id)) : null;
       if (!row && player?.name) {
@@ -138,6 +139,55 @@
       rows.push(row);
     }
     return rows;
+  }
+
+  function normalizeDealtCell(cell) {
+    if (!cell || !Number.isFinite(Number(cell.seq)) ||
+        !ERAS.has(cell.era) || !Array.isArray(cell.squad)) return null;
+    const teamId = typeof cell.team === "object"
+      ? cell.team?.team_id : cell.team;
+    const team = typeof cell.team === "object"
+      ? cell.team?.abbr || teamId : cell.team_abbr || cell.team;
+    if (!team || !teamId) return null;
+    return {
+      ...cell,
+      seq: Number(cell.seq),
+      team: String(team),
+      teamId: String(teamId),
+      squad: cell.squad.map((player) => ({
+        ...player,
+        // v4 person IDs repeat across teams and eras; card identity needs all three.
+        id: [player.player_id ?? player.id, player.team_id ?? teamId,
+          player.era || cell.era].join("|"),
+        team: String(team),
+        era: player.era || cell.era,
+        hasStats: ["ppg", "rpg", "apg"].every((key) =>
+          player.stats?.[key] !== null && player.stats?.[key] !== undefined &&
+          Number.isFinite(Number(player.stats[key]))),
+      })),
+    };
+  }
+
+  function bestLivePick(rows, entries) {
+    const states = reachableRosterStates(entries);
+    const fixed = entries.map((entry) => entry.row);
+    const used = new Set(fixed.map((row) => row.player));
+    let best = null;
+    for (const row of rows) {
+      if (used.has(row.player)) continue;
+      const plan = shortestPlacementPlan(states, row);
+      if (!plan || !movePlanUpgradesOccupiedPosition(entries, row, plan)) continue;
+      const result = calculateTeamResult([...fixed, row]);
+      // Before the last pick, value production with full-team defensive weights.
+      // The last pick is ranked by the exact final team formula.
+      const value = entries.length === 4 ? result.raw : rolloutRowValue(row);
+      if (!best || value > best.value + EPSILON ||
+          (Math.abs(value - best.value) <= EPSILON &&
+           plan.moves.length < best.moves.length)) {
+        best = { row, position: plan.position, moves: plan.moves, result, value };
+      }
+    }
+    return best;
   }
 
   function popcount(value) {
@@ -1090,6 +1140,8 @@
     matchupResult,
     opponentFromSessionPayload,
     resolveSquadRows,
+    normalizeDealtCell,
+    bestLivePick,
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
@@ -1127,13 +1179,18 @@
   };
 
   const nativeFetch = window.fetch.bind(window);
+  let rowsLoadInProgress = false;
+  function discoverDatasetUrl(value) {
+    const url = studioDatasetUrl(value);
+    if (!url) return;
+    observedDatasetUrl = url;
+    for (const resolve of datasetUrlWaiters) resolve(url);
+    datasetUrlWaiters.clear();
+    if (!rowsLoadInProgress && !runtime.liveDataMode && !runtime.dataReady)
+      startLoadingRows();
+  }
   window.fetch = (...args) => {
-    const datasetUrl = studioDatasetUrl(args[0]);
-    if (datasetUrl) {
-      observedDatasetUrl = datasetUrl;
-      for (const resolve of datasetUrlWaiters) resolve(datasetUrl);
-      datasetUrlWaiters.clear();
-    }
+    discoverDatasetUrl(args[0]);
     const request = nativeFetch(...args);
     request
       .then((response) => {
@@ -1143,11 +1200,11 @@
             response.url,
           );
         const isDealtStart =
-          /\/game-session\/api\/v3\/session\/start(?:$|[?#])/i.test(
+          /\/game-session\/api\/v(?:3|4)\/session\/start(?:$|[?#])/i.test(
             response.url,
           );
         const isDealtSpin =
-          /\/game-session\/api\/v3\/session\/spin(?:$|[?#])/i.test(
+          /\/game-session\/api\/v(?:3|4)\/session\/spin(?:$|[?#])/i.test(
             response.url,
           );
         let isVaultyApi = false;
@@ -1162,8 +1219,9 @@
           .json()
           .then((payload) => {
             captureOfficialResult(payload);
-            if (isDealtSpin) captureDealtSpin(payload);
-            else if (isDealtStart) captureDealtSession(payload);
+            const isV4 = /\/api\/v4\//i.test(response.url);
+            if (isDealtSpin) captureDealtSpin(payload, isV4);
+            else if (isDealtStart) captureDealtSession(payload, isV4);
             else if (isSeededStart)
               captureStudioSession(payload, observedDatasetUrl);
           })
@@ -1175,7 +1233,7 @@
 
   function waitForStudioDatasetUrl(timeoutMs = DATASET_WAIT_MS) {
     if (observedDatasetUrl) return Promise.resolve(observedDatasetUrl);
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const finish = (datasetUrl) => {
         window.clearTimeout(timer);
         datasetUrlWaiters.delete(finish);
@@ -1183,7 +1241,7 @@
       };
       const timer = window.setTimeout(() => {
         datasetUrlWaiters.delete(finish);
-        reject(new Error("timed out waiting for the site's player dataset"));
+        resolve(null);
       }, timeoutMs);
       datasetUrlWaiters.add(finish);
     });
@@ -1191,6 +1249,8 @@
 
   const runtime = {
     dataReady: false,
+    liveDataMode: false,
+    liveSources: new Map(),
     loadError: null,
     rows: [],
     names: [],
@@ -1628,13 +1688,19 @@
     );
   }
 
-  function captureDealtSession(payload) {
+  function captureDealtSession(payload, isV4 = false) {
     if (!payload?.session_id || !Array.isArray(payload.slots)) return;
     const sessionId = String(payload.session_id);
     const opponent = opponentFromSessionPayload(payload);
     if (opponent) setMode("1v1");
     if (runtime.dealtSessionId !== sessionId) resetRuntime(runtime.mode);
     runtime.dealtSessionId = sessionId;
+    runtime.liveDataMode = isV4;
+    if (isV4) {
+      runtime.dataReady = true;
+      runtime.loadError = null;
+      restoreLiveRows();
+    }
     runtime.oneVsOneOpponent = opponent;
     runtime.opponentPlayerIds = opponentPlayerIds(opponent?.roster);
     runtime.dealtCell = null;
@@ -1652,16 +1718,26 @@
     if (document.body) scheduleScan(0);
   }
 
-  function captureDealtSpin(payload) {
-    const cell = payload?.cell;
-    if (
-      !cell ||
-      !Number.isFinite(Number(cell.seq)) ||
-      !cell.team ||
-      !ERAS.has(cell.era) ||
-      !Array.isArray(cell.squad)
-    )
-      return;
+  function captureDealtSpin(payload, isV4 = false) {
+    const cell = isV4 ? normalizeDealtCell(payload?.cell) : payload?.cell;
+    if (!cell || !Number.isFinite(Number(cell.seq)) || !cell.team ||
+        !ERAS.has(cell.era) || !Array.isArray(cell.squad)) return;
+    if (isV4) {
+      runtime.liveDataMode = true;
+      runtime.dataReady = true;
+      runtime.loadError = null;
+      for (const player of cell.squad) {
+        if (player.hasStats) runtime.liveSources.set(player.id, player);
+      }
+      installRows(normalizeDataset([...runtime.liveSources.values()]));
+      for (const player of cell.squad) {
+        if (player.name) runtime.namesSet.add(player.name);
+      }
+      try {
+        localStorage.setItem(LIVE_ROWS_KEY,
+          JSON.stringify([...runtime.liveSources.values()].slice(-12000)));
+      } catch (_) {}
+    }
     runtime.dealtCell = {
       seq: Number(cell.seq),
       team: String(cell.team),
@@ -1881,6 +1957,7 @@
 
   async function loadRows() {
     const datasetUrl = await waitForStudioDatasetUrl();
+    if (!datasetUrl || runtime.liveDataMode) return;
     const response = await nativeFetch(datasetUrl);
     if (!response.ok)
       throw new Error(`player dataset returned ${response.status}`);
@@ -1902,6 +1979,30 @@
     ) {
       throw new Error("player dataset failed completeness checks");
     }
+    installRows(normalized);
+    runtime.optimizer = new ExactCeilingOptimizer(runtime.rows, runtime.names);
+    runtime.dataReady = true;
+    runtime.loadError = null;
+  }
+
+  function restoreLiveRows() {
+    if (!runtime.liveSources.size) {
+      try {
+        const saved = JSON.parse(localStorage.getItem(LIVE_ROWS_KEY) || "[]");
+        if (Array.isArray(saved)) for (const row of saved.slice(-12000)) {
+          if (row?.id && row?.hasStats) runtime.liveSources.set(row.id, row);
+        }
+      } catch (_) {}
+    }
+    installRows(normalizeDataset([...runtime.liveSources.values()]));
+  }
+
+  function installRows(normalized) {
+    runtime.byKey.clear();
+    runtime.byId.clear();
+    runtime.byCell.clear();
+    runtime.rowsByName.clear();
+    runtime.teams.clear();
     runtime.rows = normalized.rows;
     runtime.names = normalized.names;
     runtime.nameToId = normalized.nameToId;
@@ -1920,9 +2021,6 @@
     }
 
     loadPersistedPicks();
-
-    runtime.optimizer = new ExactCeilingOptimizer(runtime.rows, runtime.names);
-    runtime.dataReady = true;
   }
 
   function getPlayerListRoot() {
@@ -1992,7 +2090,7 @@
   }
 
   function parseCell(cards) {
-    if (runtime.dealtCell && cards.length)
+    if (runtime.dealtCell && (cards.length || runtime.liveDataMode))
       return { team: runtime.dealtCell.team, era: runtime.dealtCell.era };
     if (cards.length) return { team: cards[0].row.team, era: cards[0].row.era };
     return runtime.lastCell;
@@ -3304,6 +3402,50 @@
     return `${result.score.toFixed(1)} · ${result.wins}-${result.losses}`;
   }
 
+  function renderLiveAdvice(cell, entries, retries) {
+    const rows = currentRowsForCell(cell);
+    const missing = (runtime.dealtCell?.squad.length || 0) - rows.length;
+    const best = bestLivePick(rows, entries);
+    const move = best?.moves[0];
+    const color = move ? COLORS.position : best ? COLORS.pick : COLORS.team;
+    const target = runtime.oneVsOneOpponent?.score;
+    const status = Number.isFinite(target)
+      ? `Bot score to beat ${target.toFixed(1)} · current-roll advice`
+      : "Current-roll advice";
+    const action = move
+      ? `${move.player} · ${move.from}`
+      : best ? best.row.player
+      : missing > 0 ? "Player stats are hidden" : "No available player fits";
+    const position = move?.to || best?.position;
+    const route = move ? [
+      ...best.moves.slice(1).map((step) =>
+        `move ${step.player} ${step.from} → ${step.to}`),
+      `pick ${best.row.player} → ${best.position}`,
+    ].join("; then ") : best
+      ? `${best.row.ppg.toFixed(1)} PTS · ${best.row.rpg.toFixed(1)} REB · ${best.row.apg.toFixed(1)} AST · ${best.row.spg.toFixed(1)} STL · ${best.row.bpg.toFixed(1)} BLK`
+      : missing > 0
+        ? "This roll has no known stats yet. Classic rolls saved in this browser can provide stats for Hoop IQ."
+        : "Use an available retry to get a legal player.";
+    const unknown = missing > 0
+      ? `<div class="filter-hint">${missing} offered player${missing === 1 ? " has" : "s have"} unknown stats; ${best ? "this suggestion covers known players only" : "an accurate pick comparison is unavailable"}.</div>` : "";
+    const finalRound = entries.length === 4;
+    const details = readUiState().details ? `<div class="details">
+      <div class="row"><span>Picked team</span><strong>${entries.length}/5</strong></div>
+      <div class="row"><span>Players evaluated</span><strong>${rows.length}</strong></div>
+      <div class="row"><span>Team retry</span><strong>${retries.team.available ? "available · outcome unknown" : "unavailable"}</strong></div>
+      <div class="row"><span>Era retry</span><strong>${retries.era.available ? "available · outcome unknown" : "unavailable"}</strong></div>
+      <div class="row"><span>Method</span><strong>${finalRound ? "Highest calculated final score" : "Stat production and legal positions"}</strong></div>
+      </div>` : "";
+    renderPanel(`<div class="status" style="--status:${color}"><span class="dot"></span><span>${escapeHtml(status)}</span></div>
+      <div class="action" style="--action:${color}"><div class="eyebrow">${move ? "MOVE FIRST" : best ? "PICK NOW" : "ROLL GUIDANCE"}</div>
+      <div class="primary"><span class="name">${escapeHtml(action)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
+      <div class="sub">${escapeHtml(route)}</div>
+      ${finalRound && best ? `<div class="metrics"><span>Calculated final score</span><strong>${best.result.score.toFixed(1)}</strong></div>` : ""}</div>
+      ${unknown}<div class="fallback">Future players are hidden by the site. Final-score forecasts and 82-0 feasibility are unavailable.</div>
+      <button class="details-toggle" id="details-toggle">${readUiState().details ? "Hide details" : "Why this choice?"}</button>${details}`,
+      `live:${cell.team}:${cell.era}:${runtime.dealtCell?.seq}:${best?.row.id}:${best?.position}:${JSON.stringify(best?.moves)}:${entries.length}:${missing}:${retries.team.available}:${retries.era.available}:${readUiState().details}`);
+  }
+
   function renderAdvice(advice, entries, cards, retries) {
     const ui = readUiState();
     const current = advice.current;
@@ -3608,7 +3750,7 @@
   function findResultButton() {
     return (
       [...document.querySelectorAll("button,a")].find((element) =>
-        /^build another(?: team)?$/i.test((element.textContent || "").trim()),
+        /^(?:build another(?: team)?|draft again)$/i.test((element.textContent || "").trim()),
       ) || null
     );
   }
@@ -3839,7 +3981,7 @@
       trackName === "mode_play_classic"
     )
       resetRuntime("classic");
-    else if (/^build another(?: team)?$/.test(text)) resetRuntime(runtime.mode);
+    else if (/^(?:build another(?: team)?|draft again)$/.test(text)) resetRuntime(runtime.mode);
 
     // The new site can delay updating the lineup tray until the next roll.
     // A visible SPIN button proves the placement succeeded, so advance the
@@ -3942,7 +4084,7 @@
     detectModeFromPage();
     if (!runtime.dataReady) {
       renderLoading(
-        runtime.loadError || "Loading player peaks and expected-value optimizer…",
+        runtime.loadError || "Coach ready — start a draft and spin to load player stats.",
         Boolean(runtime.loadError),
       );
       return;
@@ -4003,13 +4145,19 @@
 
     const entries = currentEntries(trayState);
     if (entries.length < trayState.slots.size) {
-      renderLoading("Syncing your previously selected peaks…");
+      renderLoading(runtime.liveDataMode
+        ? "Stats for a selected player are unavailable. Play Classic to save stats for future Hoop IQ games."
+        : "Syncing your previously selected peaks…");
       return;
     }
     const openMask = FULL_POSITION_MASK & ~occupiedMask(entries);
     if (!openMask) return;
 
     const retries = findRetryButtons();
+    if (runtime.liveDataMode) {
+      renderLiveAdvice(cell, entries, retries);
+      return;
+    }
     const shadowState = syncShadowToCell(cell);
     if (shadowState === "waiting") {
       renderAnalyzing();
@@ -4203,6 +4351,21 @@
     renderAdvice(advice, entries, cards, retries);
   }
 
+  function startLoadingRows() {
+    if (rowsLoadInProgress || runtime.liveDataMode) return;
+    rowsLoadInProgress = true;
+    loadRows()
+      .catch((error) => {
+        if (runtime.liveDataMode) return;
+        console.error("[82-0 Coach] Failed to load player data", error);
+        runtime.loadError = `Could not load player data: ${error.message || error}`;
+      })
+      .finally(() => {
+        rowsLoadInProgress = false;
+        scheduleScan(0);
+      });
+  }
+
   function bootstrap() {
     getPanel();
     document.addEventListener("click", handleDocumentClick, true);
@@ -4216,14 +4379,16 @@
       characterData: true,
     });
 
-    renderLoading("Loading player peaks and expected-value optimizer…");
-    loadRows()
-      .then(() => scheduleScan(0))
-      .catch((error) => {
-        console.error("[82-0 Coach] Failed to load player data", error);
-        runtime.loadError = `Could not load player data: ${error.message || error}`;
-        scheduleScan(0);
+    renderLoading("Coach ready — start a draft and spin to load player stats.");
+    startLoadingRows();
+    for (const entry of performance.getEntriesByType("resource"))
+      discoverDatasetUrl(entry.name);
+    if (typeof PerformanceObserver === "function") {
+      const resources = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) discoverDatasetUrl(entry.name);
       });
+      resources.observe({ type: "resource", buffered: true });
+    }
   }
 
   if (document.readyState === "loading") {

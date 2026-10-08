@@ -16,6 +16,8 @@ const {
   matchupResult,
   opponentFromSessionPayload,
   resolveSquadRows,
+  normalizeDealtCell,
+  bestLivePick,
   reachableRosterStates,
   shortestPlacementPlan,
   movePlanUpgradesOccupiedPosition,
@@ -29,6 +31,40 @@ const {
 function row(player, team, era, positions, ppg, rpg, apg, spg, bpg) {
   return { player, team, era, positions, ppg, rpg, apg, spg, bpg };
 }
+
+const v4Cell = normalizeDealtCell({
+  seq: 0, era: "1970s",
+  team: { team_id: "356", abbr: "MIL", name: "Milwaukee Bucks" },
+  squad: [
+    { player_id: "22843", team_id: "356", era: "1970s",
+      name: "Kareem Abdul-Jabbar", positions: ["C"],
+      stats: { ppg: 30.43, rpg: 15.32, apg: 4.31, spg: 1.22, bpg: 3.41 } },
+    { player_id: "26075", team_id: "356", era: "1970s",
+      name: "Oscar Robertson", positions: ["PG"] },
+  ],
+});
+assert.equal(v4Cell.team, "MIL");
+assert.equal(v4Cell.squad[0].id, "22843|356|1970s");
+assert.equal(v4Cell.squad[1].hasStats, false,
+  "hidden stats must not become zero-valued known stats");
+assert.equal(normalizeDealtCell({ seq: 0, era: "1970s", squad: [] }), null);
+const v4Rows = normalizeDataset(v4Cell.squad.filter((player) => player.hasStats)).rows;
+const v4Pick = bestLivePick(v4Rows, []);
+assert.equal(v4Pick.row.player, "Kareem Abdul-Jabbar");
+assert.equal(v4Pick.position, "C");
+const lastPickData = normalizeDataset([
+  ...["PG", "SG", "SF", "PF"].map((position) =>
+    row(`Fixed ${position}`, "AAA", "2020s", [position], 20, 5, 3, 1, 0.5)),
+  row("Scorer", "BBB", "2020s", ["C"], 25, 5, 1, 0.5, 0.5),
+  row("Rebounder", "BBB", "2020s", ["C"], 20, 15, 3, 1, 2),
+]);
+const lastEntries = lastPickData.rows.slice(0, 4).map((candidate, index) =>
+  ({ row: candidate, position: POSITIONS[index] }));
+const lastChoice = bestLivePick(lastPickData.rows.slice(4), lastEntries);
+assert.equal(lastChoice.row.player, "Rebounder",
+  "the final recommendation must maximize the completed team's formula");
+assert.equal(lastChoice.result.raw, Math.max(...lastPickData.rows.slice(4).map((candidate) =>
+  calculateTeamResult([...lastEntries.map((entry) => entry.row), candidate]).raw)));
 
 assert.equal(TARGET_SCORE, 109.5);
 assert.equal(projectedWins(109.4), 81, "109.4 must remain an 81-win score");

@@ -8,17 +8,21 @@ A userscript for [82-0](https://82-0.com/) that recommends the best player, exac
 2. Create a new userscript and paste in [`82-0-advisor.user.js`](./82-0-advisor.user.js).
 3. Save it, refresh 82-0, and start a new game.
 
-The current site deals future rolls from its server and no longer exposes them in advance. The coach exactly optimizes the visible pool, position assignment, and lineup moves, then evaluates Team/Era retries against balanced samples of the era-first roll distribution. It keeps recalculating after every server-dealt roll because unrevealed future rolls cannot be known at the start anymore.
+Version 2.4.0 supports the October 2026 API v4 update. The site removed the downloadable player pool, changed player identities, and now returns the current team's players directly with each roll. The coach reads those responses and immediately suggests a legal player and position. It waits on the home screen without a dataset timeout.
 
-Forecasts simulate the decision the coach could actually make when each future roll becomes visible; they do not select future players with hindsight. Every serious current action is compared, and simulated future picks use a real-dataset-tested blend of accumulated team score and positional ceiling. A sampled 82-0 advantage overrides expected score only when it is large enough to be statistically meaningful. The value of preserving unused retries is carried through the remaining rounds.
+On v4, early picks use weighted stat production and legal placement. The last pick maximizes the calculated completed-team score. The full future pool is unavailable, so the panel does not claim a predicted final record, sampled win chance, optimal Team/Era retry, or proof that 82-0 is impossible. Older dataset-based sites still use the previous rollout optimizer.
+
+Hoop IQ now omits stats from its server responses. The coach saves stats encountered in Classic locally in your browser and uses them for matching Hoop IQ player/team/era cards. Unknown stats are clearly reported; a recommendation based on only part of an offer is labeled accordingly. No player data or history is uploaded.
 
 The coach is advisory only and panel-only: it reads the draft state but never outlines, relabels, disables, or otherwise modifies the website's player cards, positions, and retry buttons. All instructions appear in the side panel. Use the `⏻` button in its header to turn the coach off for as many games as you want; the small **Coach off** pill remains available to turn it back on.
 
 When a pick needs multiple lineup moves, the coach routes every move through the currently empty position and shows the rest of the sequence under the first instruction. It never begins with an occupied-position swap that can reverse on the next scan.
 
-The animated dots beside **Analyzing the roll** show that a calculation is still running. Classic and Hoop IQ use 28 balanced future scenarios. 1v1 uses 14 timer-safe scenarios and compares 18 serious current actions. Future pools are reduced to statistically strong finalists before expensive ceiling checks, and every analysis stage has a hard time budget so the panel always returns advice. Team and Era retry recommendations are written clearly in the panel while the site's controls remain untouched.
+Current v4 recommendations use the live offer directly and do not wait for a missing dataset. On older sites, animated dots beside **Analyzing the roll** show that the bounded rollout calculation is running.
 
-In 1v1, the site supplies the bot's completed score with the match session and decides the verdict by comparing the two raw scores. The coach now captures that target, shows it in the panel, and optimizes sampled probability of beating that specific bot instead of chasing the unrelated 82-0 threshold. Expected score breaks statistically uncertain ties. The final panel reports the actual score-versus-score matchup and also verifies the coach's score model against the site's returned user score.
+In 1v1, the coach shows the bot's target score when supplied by the session. On older dataset-based sites it optimizes sampled probability of beating that bot. On v4 it recommends from the live offer; the final panel compares the two scores when available.
+
+At the time of verification, the website's 1v1 button opened an app-download prompt. Userscripts run in the browser and cannot run inside the native app.
 
 Every live recommendation is restricted to the exact player squad returned by the server for that roll. In 1v1, bot-owned player IDs are also removed from future-roll and retry forecasts, so the coach never recommends a historical team/era player who is not actually available in the match.
 
