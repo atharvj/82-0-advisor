@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.7.0
+// @version      2.8.0
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.7.0";
+  const VERSION = "2.8.0";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -46,6 +46,8 @@
   // from this old curve or its 82-win threshold.
   const RECORD_SCORE_CAP = 110;
   const TARGET_SCORE = 109.5;
+  // Provisional score-only outlook marker, NOT a verified v4 win cutoff.
+  const LIVE_82_BENCHMARK = 110;
   const EPSILON = 1e-10;
   // Anonymous Classic roll samples collected 2026-10-07. Planning priors only:
   // [franchise id, era, [name, position mask, PTS, REB, AST, STL, BLK][]].
@@ -604,7 +606,8 @@
         }
       }
       if (!best && kind === "pick") kind = team ? "team" : era ? "era" : "dead";
-      return { kind, best, forecasts, sampleCount: this.pools.length };
+      return { kind, best, forecasts, sampleCount: this.pools.length,
+        stealWeight: this.stealWeight, blockWeight: this.blockWeight };
     }
   }
 
@@ -1571,6 +1574,100 @@
       y: clamp(position.y, viewportHeight - height - 8) };
   }
 
+  function freeRetryAvailable(button, booster) {
+    if (!button?.available) return false;
+    if (!booster) return true; // Older site / absent metadata: use the button.
+    return booster.enabled !== false && Number(booster.free_left) > 0 &&
+      (booster.next_use === "free" || booster.next_use == null);
+  }
+
+  function expectedActionScore(action) {
+    return action?.forecastRaw ?? action?.ceiling?.raw ?? -Infinity;
+  }
+
+  function chooseScoreAdvice(current, teamRetry, eraRetry, retries) {
+    const retryScore = (retry) => retry?.reachableMeanRaw ??
+      (retry?.exact ? retry.decisionRaw : null) ?? retry?.meanRaw ?? -Infinity;
+    const legal = (retry) => retry && (retry.reachableLegal ?? retry.legalCount > 0);
+    let bestRetry = null;
+    for (const retry of [retries.team.available ? teamRetry : null,
+      retries.era.available ? eraRetry : null]) {
+      if (legal(retry) && (!bestRetry || retryScore(retry) > retryScore(bestRetry) + EPSILON))
+        bestRetry = retry;
+    }
+    if (!current.best) return bestRetry
+      ? { kind: bestRetry.scope, reason: "No legal player fits; retry to find a playable offer." }
+      : { kind: "dead", reason: "No legal pick or retry is available." };
+    if (bestRetry) {
+      const gain = retryScore(bestRetry) - expectedActionScore(current.best);
+      if (gain > EPSILON) return { kind: bestRetry.scope,
+        reason: `This retry improves the expected final score by about ${gain.toFixed(1)} points.` };
+    }
+    return { kind: "pick", reason: "Picking now has the highest estimated final score." };
+  }
+
+  function liveExpectedFinalScore(advice, entries) {
+    // In the last two rounds the planner's value is a complete-team increment
+    // relative to the fixed roster. Earlier rounds use the same predicted
+    // defense denominators as its additive model, not inflated partial scores.
+    const value = advice.kind === "team" || advice.kind === "era"
+      ? advice.forecasts[advice.kind] : advice.best?.value;
+    if (!Number.isFinite(value)) return null;
+    if (entries.length >= 3) return rawTeamScore(entries.map((entry) => entry.row)) + value;
+    const { stealWeight, blockWeight } = advice;
+    if (!Number.isFinite(stealWeight) || !Number.isFinite(blockWeight)) return null;
+    return value + entries.reduce((sum, { row }) => sum + COEFF_PPG * row.ppg +
+      COEFF_RPG * row.rpg + COEFF_APG * row.apg + stealWeight * row.spg + blockWeight * row.bpg, 0);
+  }
+
+  function live82Outlook(advice, entries, missing, history = []) {
+    const forecast = missing > 0 && !advice.best ? null : liveExpectedFinalScore(advice, entries);
+    // v4's record conversion is server-only. 110 is a planning reference, not
+    // a verified threshold or a reason to declare mathematical impossibility.
+    // Recent official v4 records can refine the reference; never use the old
+    // legacy projectedWins curve or records from an unknown protocol.
+    const observations = history.filter((entry) => entry?.protocol === "v4" &&
+      ["classic", "hoopiq", "1v1"].includes(entry.mode) &&
+      Number.isFinite(entry.score) && Number.isInteger(entry.wins) &&
+      entry.wins >= 0 && entry.wins <= 82 &&
+      Date.now() - entry.at >= 0 && Date.now() - entry.at < 7 * 24 * 60 * 60 * 1000);
+    const perfect = observations.filter((entry) => entry.wins === 82).map((entry) => entry.score);
+    const nonperfect = observations.filter((entry) => entry.wins < 82).map((entry) => entry.score);
+    const low = nonperfect.length ? Math.max(...nonperfect) : null;
+    const high = perfect.length ? Math.min(...perfect) : null;
+    const contradictory = low !== null && high !== null && low >= high;
+    const reference = !contradictory && high !== null ? high :
+      Math.max(LIVE_82_BENCHMARK, !contradictory && low !== null ? low + 0.1 : 0);
+    const calibrated = !contradictory && high !== null;
+    const uncertain = missing > 0 || advice.sampleCount < 8 || !Number.isFinite(forecast) || contradictory;
+    return {
+      state: uncertain ? "uncertain" : forecast >= reference ? "promising" : "unlikely",
+      label: uncertain ? "82-0 outlook uncertain" : forecast >= reference
+        ? "82-0 likely possible · estimate" : "82-0 unlikely · estimate",
+      forecast, reference,
+      explanation: calibrated
+        ? `Score outlook compared with ${reference.toFixed(1)}, a recent 82-0 result in this browser. Hidden future rolls make this an estimate, not a guarantee.`
+        : `Score outlook compared with a ${reference.toFixed(1)}-point planning benchmark. The current server's exact 82-win cutoff is unverified; this is not a probability or proof of impossibility.`,
+    };
+  }
+
+  function legacy82Outlook(advice, modelMismatch = false) {
+    if (modelMismatch) return { state: "uncertain", label: "82-0 outlook uncertain", explanation: "The scoring model needs re-verification." };
+    const proven = advice.seededPlan?.result || advice.priorCeiling;
+    if (proven?.possible82 === false) return { state: "impossible", label: "82-0 impossible",
+      explanation: "Even the complete-dataset/exact-plan score bound is below the verified legacy 82-win target." };
+    if (advice.seededPlan?.result?.possible82) return { state: "promising", label: "82-0 achievable · exact plan",
+      explanation: "The verified legacy seeded plan reaches 82 wins." };
+    const retry = advice.kind === "team" ? advice.teamRetry : advice.kind === "era" ? advice.eraRetry : null;
+    const rate = retry ? retry.pathRate : advice.current?.best?.forecastPathRate;
+    const forecast = retry ? retry.meanRaw : advice.current?.best?.forecastRaw;
+    const uncertain = !Number.isFinite(rate) && !Number.isFinite(forecast);
+    const promising = Number.isFinite(rate) ? rate >= 0.5 : forecast >= TARGET_SCORE;
+    return { state: uncertain ? "uncertain" : promising ? "promising" : "unlikely",
+      label: uncertain ? "82-0 outlook uncertain" : promising ? "82-0 likely possible · estimate" : "82-0 unlikely · estimate",
+      explanation: "Outlook uses the verified legacy curve and sampled future scores, independently of the bot's score. No sampled successes does not prove impossibility." };
+  }
+
   const Core = {
     POSITIONS,
     TARGET_SCORE,
@@ -1592,6 +1689,12 @@
     LiveDraftPlanner,
     livePlannerWorkerSource,
     clampPanelPosition,
+    freeRetryAvailable,
+    chooseScoreAdvice,
+    compareForecastActions,
+    liveExpectedFinalScore,
+    live82Outlook,
+    legacy82Outlook,
     FixedSlotDraftPlanner,
     rosterFamily,
     extendRosterFamily,
@@ -1881,6 +1984,7 @@
         id,
         at: Date.now(),
         version: VERSION,
+        protocol: runtime.liveDataMode ? "v4" : "legacy",
         mode: runtime.mode,
         wins: result.wins,
         score: Number.isFinite(score) ? score : null,
@@ -1966,6 +2070,8 @@
         #window-note:empty { display:none; }
         #card.collapsed main { display:none; }
         .status { display:flex; align-items:center; gap:7px; margin-bottom:7px; color:#aab8c8; font-size:10px; }
+        .outlook { display:flex; align-items:center; gap:7px; margin:0 0 7px; font-size:10px; color:#c0cddd; }
+        .retry-summary { display:flex; justify-content:space-between; gap:8px; margin-top:7px; color:#8da1ba; font-size:9px; }
         .dot { width:7px; height:7px; border-radius:50%; flex:0 0 auto; background:var(--status,#38bdf8); box-shadow:0 0 9px var(--status,#38bdf8); }
         .action { --action:#38bdf8; border:1px solid color-mix(in srgb,var(--action) 55%,#172337); background:color-mix(in srgb,var(--action) 10%,#07101e); border-radius:10px; padding:9px 10px; }
         .eyebrow { color:var(--action); font-size:9px; font-weight:900; letter-spacing:.11em; text-transform:uppercase; }
@@ -2042,6 +2148,7 @@
         hidden: state.hidden, disabled: !state.enabled, "details-open": state.details, detached }))
         card.classList.toggle(name, value);
       shadow.querySelector(".title").textContent = !state.enabled ? "Coach off" : detached ? "Coach window" : "82-0 Coach";
+      shadow.querySelector(".title").title = `82-0 Coach v${VERSION} · highest final score`;
       shadow.querySelector(".mode").textContent = modeLabel();
       shadow.getElementById("power").title = state.enabled ? "Turn coach off" : "Turn coach on";
       shadow.getElementById("collapse").textContent = state.collapsed ? "+" : "—";
@@ -3128,43 +3235,12 @@
 
   function compareForecastActions(left, right) {
     if (!right) return 1;
-    const opponentScore = runtime.oneVsOneOpponent?.score;
-    const matchupMode =
-      runtime.mode === "1v1" && Number.isFinite(opponentScore);
-    const leftPath = matchupMode
-      ? left.forecastMatchupRate ??
-        Number(matchupResult(left.ceiling.raw, opponentScore) === "win")
-      : left.forecastPathRate ?? Number(left.ceiling.possible82);
-    const rightPath = matchupMode
-      ? right.forecastMatchupRate ??
-        Number(matchupResult(right.ceiling.raw, opponentScore) === "win")
-      : right.forecastPathRate ?? Number(right.ceiling.possible82);
-    const leftTrials = left.forecastOutcomes ?? 1;
-    const rightTrials = right.forecastOutcomes ?? 1;
-    if (
-      meaningfulRateAdvantage(
-        leftPath,
-        leftTrials,
-        rightPath,
-        rightTrials,
-      )
-    )
-      return 1;
-    if (
-      meaningfulRateAdvantage(
-        rightPath,
-        rightTrials,
-        leftPath,
-        leftTrials,
-      )
-    )
-      return -1;
-    const leftForecast = left.forecastRaw ?? left.ceiling.raw;
-    const rightForecast = right.forecastRaw ?? right.ceiling.raw;
+    // Same score-first objective in Classic, Hoop IQ, and 1v1, including
+    // legacy dataset-backed sessions. Bot-win/82-win rates are display only.
+    const leftForecast = expectedActionScore(left);
+    const rightForecast = expectedActionScore(right);
     if (Math.abs(leftForecast - rightForecast) > EPSILON)
       return leftForecast > rightForecast ? 1 : -1;
-    if (Math.abs(leftPath - rightPath) > EPSILON)
-      return leftPath > rightPath ? 1 : -1;
     return compareActions(left, right);
   }
 
@@ -3881,9 +3957,10 @@
     return {
       team: {
         element: team || null,
-        available: Boolean(team && !team.disabled),
+        available: Boolean(team && !team.disabled && team.getAttribute("aria-disabled") !== "true"),
       },
-      era: { element: era || null, available: Boolean(era && !era.disabled) },
+      era: { element: era || null,
+        available: Boolean(era && !era.disabled && era.getAttribute("aria-disabled") !== "true") },
     };
   }
 
@@ -3895,108 +3972,7 @@
     priorCeiling,
     openSlots,
   ) {
-    const opponentScore = runtime.oneVsOneOpponent?.score;
-    const matchupMode =
-      runtime.mode === "1v1" && Number.isFinite(opponentScore);
-    const retryLegal = (retry) =>
-      retry?.reachableLegal ?? retry?.legalCount > 0;
-    const retryValue = (retry) => retry?.decisionRaw ?? retry?.meanRaw ?? 0;
-    const retryPath = (retry) =>
-      matchupMode
-        ? retry?.reachableMatchup
-          ? 1
-          : retry?.matchupRate ?? 0
-        : retry?.reachablePath
-          ? 1
-          : retry?.pathRate ?? 0;
-    const retryTrials = (retry) =>
-      matchupMode ? retry?.matchupTrials ?? 1 : retry?.pathTrials ?? 1;
-    const availableRetries = [
-      retries.team.available && teamRetry ? teamRetry : null,
-      retries.era.available && eraRetry ? eraRetry : null,
-    ].filter(retryLegal);
-    const bestRetry = availableRetries.reduce((winner, retry) => {
-      if (!winner) return retry;
-      if (
-        meaningfulRateAdvantage(
-          retryPath(retry),
-          retryTrials(retry),
-          retryPath(winner),
-          retryTrials(winner),
-        )
-      )
-        return retry;
-      if (
-        meaningfulRateAdvantage(
-          retryPath(winner),
-          retryTrials(winner),
-          retryPath(retry),
-          retryTrials(retry),
-        )
-      )
-        return winner;
-      if (Math.abs(retryValue(retry) - retryValue(winner)) > EPSILON) {
-        return retryValue(retry) > retryValue(winner) ? retry : winner;
-      }
-      return winner;
-    }, null);
-    if (!current.best) {
-      if (bestRetry)
-        return {
-          kind: bestRetry.scope,
-          reason: "No legal player fits an open position.",
-        };
-      return { kind: "dead", reason: "No legal pick or retry is available." };
-    }
-
-    if (!bestRetry)
-      return { kind: "pick", reason: "This has the strongest expected finish." };
-    const currentValue =
-      current.best.forecastDecisionRaw ??
-      current.best.forecastRaw ??
-      current.best.ceiling.raw;
-    const currentPath =
-      matchupMode
-        ? current.best.forecastMatchupRate ??
-          Number(matchupResult(current.best.ceiling.raw, opponentScore) === "win")
-        : current.best.forecastPathRate ??
-          Number(current.best.ceiling.possible82);
-    const expectedGain = retryValue(bestRetry) - currentValue;
-    const pathGainIsMeaningful = meaningfulRateAdvantage(
-      retryPath(bestRetry),
-      retryTrials(bestRetry),
-      currentPath,
-      current.best.forecastOutcomes ?? 1,
-    );
-    const pathLossIsMeaningful = meaningfulRateAdvantage(
-      currentPath,
-      current.best.forecastOutcomes ?? 1,
-      retryPath(bestRetry),
-      retryTrials(bestRetry),
-    );
-    if (pathGainIsMeaningful && expectedGain > -0.75) {
-      return {
-        kind: bestRetry.scope,
-        reason: bestRetry.chainRecommended
-          ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; this is the stronger ${matchupMode ? "route to beat the bot" : "route to 82-0"}.`
-          : `This retry gives the stronger sampled ${matchupMode ? "win chance" : "route to 82-0"} (${Math.round(currentPath * 100)}% → ${Math.round(retryPath(bestRetry) * 100)}%).`,
-      };
-    }
-    if (!pathLossIsMeaningful && expectedGain > 0.25 + EPSILON) {
-      return {
-        kind: bestRetry.scope,
-        reason: bestRetry.chainRecommended
-          ? `Use ${bestRetry.scope.toUpperCase()} retry, then ${bestRetry.chain.scope.toUpperCase()} retry; that branch adds about ${expectedGain.toFixed(1)} ceiling points.`
-          : `The retry improves the expected final score by about ${expectedGain.toFixed(1)} points.`,
-      };
-    }
-    return {
-      kind: "pick",
-      reason:
-        expectedGain > 0
-          ? "The small expected gain is not worth spending the retry this early."
-          : "Picking now has the stronger expected finish; save both retries.",
-    };
+    return chooseScoreAdvice(current, teamRetry, eraRetry, retries);
   }
 
   function clearHighlights() {
@@ -4115,11 +4091,8 @@
   function renderLiveAdvice(cell, entries, retries) {
     const rows = currentRowsForCell(cell);
     const missing = (runtime.dealtCell?.squad.length || 0) - rows.length;
-    const freeRetry = (scope) => {
-      const booster = runtime.dealtCell?.boosters?.[`respin_${scope}`];
-      return retries[scope].available && (!booster ||
-        (booster.enabled !== false && booster.next_use === "free" && booster.free_left > 0));
-    };
+    const freeRetry = (scope) => freeRetryAvailable(retries[scope],
+      runtime.dealtCell?.boosters?.[`respin_${scope}`]);
     const available = { team: freeRetry("team"), era: freeRetry("era") };
     const analysisKey = JSON.stringify([runtime.dealtCell?.seq, cell.team, cell.era,
       entries.map((entry) => [entry.row.key, entry.position]), available,
@@ -4142,13 +4115,19 @@
       scheduleScan(120);
       return;
     }
-    const isRetry = advice.kind === "team" || advice.kind === "era";
+    // Unknown stats are not evidence of a bad/illegal offer. Do not spend free
+    // retries just because no current player can be scored (common in Hoop IQ).
+    const incompleteOffer = missing > 0 && !best;
+    const isRetry = !incompleteOffer && (advice.kind === "team" || advice.kind === "era");
     const move = !isRetry && best?.moves[0];
     const color = isRetry ? COLORS[advice.kind] : move ? COLORS.position : best ? COLORS.pick : COLORS.team;
     const target = runtime.oneVsOneOpponent?.score;
-    const status = Number.isFinite(target)
-      ? `Bot score to beat ${target.toFixed(1)}`
+    const status = incompleteOffer ? "Stats needed to compare this roll" : Number.isFinite(target)
+      ? `Highest-score planning · bot ${target.toFixed(1)}`
       : isRetry ? "Retry recommended before picking" : "Best modeled draft route";
+    const outlook = live82Outlook(advice, entries, missing, readResultHistory());
+    const outlookColor = outlook.state === "promising" ? COLORS.pick :
+      outlook.state === "unlikely" ? COLORS.team : COLORS.muted;
     const action = isRetry ? `Reroll ${advice.kind === "team" ? "TEAM" : "ERA"}` : move
       ? `${move.player} · ${move.from}`
       : best ? best.row.player
@@ -4169,153 +4148,70 @@
       ? `<div class="filter-hint">${missing} offered player${missing === 1 ? " has" : "s have"} unknown stats; ${best ? "this suggestion covers known players only" : "an accurate pick comparison is unavailable"}.</div>` : "";
     const finalRound = entries.length === 4;
     const forecastText = (scope) => !available[scope] ? "no free retry" :
+      incompleteOffer ? "cannot compare without player stats" :
       advice.forecasts[scope] === null ? "not enough samples" :
         best ? `${(advice.forecasts[scope] - best.value) >= 0 ? "+" : ""}${(advice.forecasts[scope] - best.value).toFixed(1)} estimated score vs pick` : "retry to find a legal pick";
+    const compactRetryText = (scope) => {
+      if (!available[scope]) return "no free retry";
+      if (incompleteOffer) return "stats unknown";
+      if (advice.forecasts[scope] === null) return "insufficient data";
+      if (!best) return "find a legal pick";
+      const delta = advice.forecasts[scope] - best.value;
+      return Math.abs(delta) < 0.05 ? delta > EPSILON ? "+<0.1 pts" : "≈0 pts" :
+        `${delta > 0 ? "+" : ""}${delta.toFixed(1)} pts`;
+    };
     const details = readUiState().details ? `<div class="details">
       <div class="row"><span>Picked team</span><strong>${entries.length}/5</strong></div>
       <div class="row"><span>Players evaluated</span><strong>${rows.length}</strong></div>
       <div class="row"><span>Team retry</span><strong>${forecastText("team")}</strong></div>
       <div class="row"><span>Era retry</span><strong>${forecastText("era")}</strong></div>
       <div class="row"><span>Method</span><strong>Flexible-roster score planning</strong></div>
+      <div class="row"><span>Objective · version</span><strong>Highest final score · ${VERSION}</strong></div>
+      ${Number.isFinite(outlook.forecast) ? `<div class="row"><span>Estimated final score</span><strong>${outlook.forecast.toFixed(1)}</strong></div>` : ""}
       ${entries.length >= 3 ? '<div class="row"><span>Scoring</span><strong>Complete-team formula</strong></div>' : ""}
       <div class="row"><span>Planning samples</span><strong>${advice.sampleCount} team/era pools</strong></div>
-      <div class="sub">Retry estimates use sampled rolls and your locally saved Classic stats. They are estimates, not guaranteed outcomes or proof of 82-0 feasibility.</div>
+      <div class="sub">${escapeHtml(outlook.explanation)}</div>
+      <div class="sub">Retry gains compare using a free retry now with picking and keeping it for later. The bot's score never changes this score-first objective. Samples are estimates, not known future rolls.</div>
       </div>` : "";
     renderPanel(`<div class="status" style="--status:${color}"><span class="dot"></span><span>${escapeHtml(status)}</span></div>
+      <div class="outlook" data-state="${outlook.state}" title="${escapeHtml(outlook.explanation)}" style="--status:${outlookColor}"><span class="dot"></span><span>${escapeHtml(outlook.label)}</span></div>
       <div class="action" style="--action:${color}"><div class="eyebrow">${isRetry ? "REROLL NOW" : move ? "MOVE FIRST" : best ? "PICK NOW" : "ROLL GUIDANCE"}</div>
       <div class="primary"><span class="name">${escapeHtml(action)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
       <div class="sub">${escapeHtml(route)}</div>
       ${finalRound && best && !isRetry ? `<div class="metrics"><span>Calculated final score</span><strong>${best.result.score.toFixed(1)}</strong></div>` : ""}</div>
       ${unknown}${isRetry && best ? `<div class="fallback">If you prefer to pick: ${escapeHtml(best.row.player)} → ${best.position}${best.moves.length ? " (requires a lineup move)" : ""}.</div>` : ""}
+      <div class="retry-summary" title="Estimated final-score change from using the free retry now instead of picking and keeping it for later"><span>Team: ${compactRetryText("team")}</span><span>Era: ${compactRetryText("era")}</span></div>
       <button class="details-toggle" id="details-toggle">${readUiState().details ? "Hide details" : "Why this choice?"}</button>${details}`,
-      `live:${analysisKey}:${advice.kind}:${best?.row.id}:${best?.position}:${JSON.stringify(best?.moves)}:${missing}:${readUiState().details}`);
+      `live:${analysisKey}:${advice.kind}:${best?.row.id}:${best?.position}:${JSON.stringify(best?.moves)}:${missing}:${outlook.state}:${outlook.reference}:${readUiState().details}`);
   }
 
   function renderAdvice(advice, entries, cards, retries) {
     const ui = readUiState();
     const current = advice.current;
     const best = current.best;
+    const outlook = legacy82Outlook(advice, runtime.modelMismatch);
+    const outlookColor = outlook.state === "impossible" ? COLORS.impossible :
+      outlook.state === "promising" ? COLORS.pick : outlook.state === "unlikely" ? COLORS.team : COLORS.muted;
     const seededResult = advice.seededPlan?.result || null;
     const isRetry = advice.kind === "team" || advice.kind === "era";
     const move = advice.kind === "pick" ? best?.moves?.[0] : null;
     const isOneVsOne = runtime.mode === "1v1";
     const opponentScore = runtime.oneVsOneOpponent?.score;
     const hasOpponentScore = Number.isFinite(opponentScore);
-    const retriesAvailable = retries.team.available || retries.era.available;
-    const retryCanRestoreCeiling = Boolean(
-      isOneVsOne && hasOpponentScore
-        ? (advice.teamRetry?.reachableMatchup ??
-            advice.teamRetry?.matchupRate > 0) ||
-            (advice.eraRetry?.reachableMatchup ??
-              advice.eraRetry?.matchupRate > 0)
-        : (advice.teamRetry?.reachablePath ??
-            advice.teamRetry?.ceilingPathRate > 0) ||
-            (advice.eraRetry?.reachablePath ??
-              advice.eraRetry?.ceilingPathRate > 0),
-    );
-    const availableRetrySummaries = [
-      retries.team.available ? advice.teamRetry : null,
-      retries.era.available ? advice.eraRetry : null,
-    ].filter(Boolean);
-    const exactRetryTreeExhausted = Boolean(
-      retriesAvailable &&
-        availableRetrySummaries.length ===
-          Number(retries.team.available) + Number(retries.era.available) &&
-        availableRetrySummaries.every((retry) => retry.exact) &&
-        !retryCanRestoreCeiling,
-    );
-    const impossible =
-      !runtime.modelMismatch &&
-      (isOneVsOne && hasOpponentScore
-        ? advice.priorCeiling &&
-          matchupResult(advice.priorCeiling.raw, opponentScore) !== "win"
-        : seededResult
-          ? !seededResult.possible82
-          : advice.priorCeiling && !advice.priorCeiling.possible82);
-    const currentCanKeepCeiling = current.actions.some(
-      (action) =>
-        isOneVsOne && hasOpponentScore
-          ? matchupResult(action.ceiling.raw, opponentScore) === "win"
-          : action.ceiling.possible82,
-    );
-    const forcedImpossible =
-      !runtime.modelMismatch &&
-      !seededResult &&
-      !impossible &&
-      !currentCanKeepCeiling &&
-      (!retriesAvailable ||
-        exactRetryTreeExhausted ||
-        !retryCanRestoreCeiling);
     const chosenRetry =
       advice.kind === "team"
         ? advice.teamRetry
         : advice.kind === "era"
           ? advice.eraRetry
           : null;
-    const recommendedKeepsCeiling = isRetry
-      ? isOneVsOne && hasOpponentScore
-        ? chosenRetry?.reachableMatchup ?? chosenRetry?.matchupRate > 0
-        : chosenRetry?.reachablePath ?? chosenRetry?.ceilingPathRate > 0
-      : isOneVsOne && hasOpponentScore
-        ? best && matchupResult(best.ceiling.raw, opponentScore) === "win"
-        : best?.ceiling.possible82;
-    const atRisk =
-      !runtime.modelMismatch &&
-      !seededResult &&
-      !impossible &&
-      !forcedImpossible &&
-      !recommendedKeepsCeiling;
-    const sampledPathRate = seededResult
-      ? Number(seededResult.possible82)
-      : isRetry
-        ? isOneVsOne && hasOpponentScore
-          ? chosenRetry?.matchupRate || 0
-          : chosenRetry?.pathRate || 0
-        : isOneVsOne && hasOpponentScore
-          ? best?.forecastMatchupRate || 0
-          : best?.forecastPathRate || 0;
-    const sampledPathPercent = Math.round(sampledPathRate * 100);
-    const bestReachableScore = roundOne(
-      Math.max(
-        0,
-        ...current.actions.map((action) => action.ceiling.raw),
-        ...availableRetrySummaries.map(
-          (retry) => retry.best?.ceiling.raw || 0,
-        ),
-      ),
-    );
     const statusColor = runtime.modelMismatch
       ? COLORS.team
-      : impossible || forcedImpossible
-        ? COLORS.impossible
-        : atRisk || sampledPathPercent < 25
-          ? COLORS.team
-          : COLORS.pick;
+      : isRetry ? COLORS[advice.kind] : move ? COLORS.position : COLORS.pick;
     const statusText = runtime.modelMismatch
       ? "Site model changed — recommendations are provisional"
-      : isOneVsOne
-        ? hasOpponentScore
-          ? impossible
-            ? `Bot score ${opponentScore.toFixed(1)} · win impossible · absolute max ${advice.priorCeiling.score.toFixed(1)}`
-            : forcedImpossible
-              ? `Bot score ${opponentScore.toFixed(1)} · win now unreachable · best reachable ${bestReachableScore.toFixed(1)}`
-            : sampledPathPercent
-              ? `Bot score to beat ${opponentScore.toFixed(1)} · ${sampledPathPercent}% sampled win chance`
-              : `Bot score to beat ${opponentScore.toFixed(1)} · a win remains possible`
-          : "1v1 · optimizing the highest final score"
-      : impossible
-        ? seededResult
-          ? `82-0 impossible · exact seeded max ${seededResult.score.toFixed(1)}`
-          : `82-0 impossible · absolute max ${advice.priorCeiling.score.toFixed(1)}`
-        : forcedImpossible
-          ? `82-0 now impossible · best reachable max ${bestReachableScore.toFixed(1)}`
-          : atRisk
-            ? "82-0 remains mathematically possible · recommendation favors the higher average"
-            : seededResult
-              ? `82-0 achievable · exact seeded max ${seededResult.score.toFixed(1)}`
-              : sampledPathPercent
-                ? `82-0 mathematically possible · ${sampledPathPercent}% of sampled futures`
-                : "82-0 mathematically possible · not reached in sampled futures";
+      : isOneVsOne && hasOpponentScore ? `Highest-score planning · bot ${opponentScore.toFixed(1)}`
+      : seededResult ? `Exact highest-score plan · ${seededResult.score.toFixed(1)} points`
+      : isRetry ? "Retry recommended before picking" : "Highest-score planning";
     const actionColor = isRetry
       ? COLORS[advice.kind]
       : move
@@ -4422,6 +4318,7 @@
           <div class="row"><span>Picked team now</span><strong>${entries.length}/5 · ${scoreText(pickedResult)}</strong></div>
           ${isOneVsOne && hasOpponentScore ? `<div class="row"><span>Bot score to beat</span><strong>${opponentScore.toFixed(1)}</strong></div>` : ""}
           <div class="row"><span>Expected final</span><strong>${escapeHtml(expectedLine)}</strong></div>
+          <div class="row"><span>Objective · version</span><strong>Highest final score · ${VERSION}</strong></div>
           <div class="row"><span>Best current-pool ceiling</span><strong>${escapeHtml(currentLine)}</strong></div>
           ${seededResult ? `<div class="row"><span>Exact seeded final maximum</span><strong>${escapeHtml(scoreText(seededResult))}</strong></div>` : ""}
           <div class="row"><span>Team retry forecast</span><strong>${escapeHtml(teamForecast)}</strong></div>
@@ -4461,6 +4358,7 @@
         : stats;
     const html = `
       <div class="status" style="--status:${statusColor}"><span class="dot"></span><span>${escapeHtml(statusText)}</span></div>
+      <div class="outlook" data-state="${outlook.state}" title="${escapeHtml(outlook.explanation)}" style="--status:${outlookColor}"><span class="dot"></span><span>${escapeHtml(outlook.label)}</span></div>
       <div class="action" style="--action:${actionColor}">
         <div class="eyebrow">${eyebrow}</div>
         <div class="primary"><span class="name">${escapeHtml(primary)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
@@ -4480,8 +4378,7 @@
       player: best?.row.key,
       position: best?.position,
       move: move ? `${move.player}:${move.from}:${move.to}` : "",
-      impossible,
-      forcedImpossible,
+      outlook: outlook.state,
       seeded: seededResult?.raw,
       mismatch: runtime.modelMismatch,
       opponentScore,
@@ -5139,6 +5036,9 @@
       childList: true,
       subtree: true,
       characterData: true,
+      attributes: true,
+      attributeFilter: ["disabled", "aria-disabled", "data-selectable", "aria-label",
+        "data-position", "data-court-slot"],
     });
 
     renderLoading("Coach ready — start a draft and spin to load player stats.");
