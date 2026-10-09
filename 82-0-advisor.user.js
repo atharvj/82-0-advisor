@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.8.0
+// @version      2.8.1
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.8.0";
+  const VERSION = "2.8.1";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -599,14 +599,26 @@
       };
       let kind = "pick";
       let value = best?.value ?? -Infinity;
-      for (const scope of ["team", "era"]) {
+      const consider = (scope) => {
         if (forecasts[scope] !== null && forecasts[scope] > value + EPSILON) {
           kind = scope;
           value = forecasts[scope];
         }
-      }
+      };
+      for (const scope of ["team", "era"]) consider(scope);
       if (!best && kind === "pick") kind = team ? "team" : era ? "era" : "dead";
-      return { kind, best, forecasts, sampleCount: this.pools.length,
+      const withoutPurchaseKind = kind;
+      // Purchase-only controls are conditional quotes, not inventory. Compare
+      // buying one retry now without pretending it can be saved for later or
+      // that the user can afford it. Normal picks retain only usable retries.
+      for (const scope of ["team", "era"]) {
+        if (!retries[scope] && retries.purchase?.[scope]) {
+          forecasts[scope] = this.retryExpectation(
+            this.state(this.initialFamily, team, era).table, cell, scope);
+          consider(scope);
+        }
+      }
+      return { kind, withoutPurchaseKind, best, forecasts, sampleCount: this.pools.length,
         stealWeight: this.stealWeight, blockWeight: this.blockWeight };
     }
   }
@@ -1574,11 +1586,51 @@
       y: clamp(position.y, viewportHeight - height - 8) };
   }
 
-  function freeRetryAvailable(button, booster) {
-    if (!button?.available) return false;
-    if (!booster) return true; // Older site / absent metadata: use the button.
-    return booster.enabled !== false && Number(booster.free_left) > 0 &&
-      (booster.next_use === "free" || booster.next_use == null);
+  function retryAvailability(button, booster) {
+    const status = (source, label, available = false, purchase = false) =>
+      ({ source, label, available, purchase });
+    // Buttons are locked during animations. Do not confuse that with spent
+    // inventory, and rescan when disabled/aria-disabled changes.
+    if (!button?.available) return status("unavailable", "not ready");
+    if (!booster || typeof booster !== "object")
+      return status("unknown", "available · check cost", true);
+    const next = booster.next_use;
+    if (next === "none") {
+      // The official frontend leaves purchase controls active after the free
+      // use is spent. Separate coin caps supersede max_per_draft on v4.
+      const splitCaps = ["used_rv", "rv_per_draft", "used_coins", "coins_per_draft"]
+        .some((key) => booster[key] !== undefined);
+      const cap = splitCaps ? booster.coins_per_draft ?? booster.max_per_draft : booster.max_per_draft;
+      const used = splitCaps ? booster.used_coins ?? 0 : booster.used_in_draft ?? 0;
+      if (cap != null && Number(used) >= Number(cap))
+        return status("unavailable", "retry limit reached");
+      return status("purchase", "purchase option", false, true);
+    }
+    if (booster.enabled === false) return status("unavailable", "unavailable");
+    if (next === "coins") return status("coins", "coins required", false, true);
+    const source = ["free", "owned", "rv", "coins"].includes(next) ? next :
+      Number(booster.free_left) > 0 ? "free" : Number(booster.owned_left) > 0 ? "owned" :
+      Number(booster.rv_left) > 0 ? "rv" : "unknown";
+    // Like the site's own readiness check, next_use is authoritative. Some
+    // responses omit counters or retain older counters alongside a new source.
+    return status(source, { free: "free", owned: "owned token", rv: "watch ad",
+      coins: "coins required", unknown: "available · check cost" }[source], true);
+  }
+
+  function mergeRetryBoosters(current, payload) {
+    const merged = { ...current };
+    for (const root of [payload, payload?.data, payload?.cell, payload?.data?.cell]) {
+      for (const key of ["respin_team", "respin_era"]) {
+        const booster = root?.boosters?.[key];
+        if (!booster || typeof booster !== "object" ||
+            !["next_use", "free_left", "owned_left", "rv_left", "remaining", "enabled"]
+              .some((field) => booster[field] !== undefined)) continue;
+        // Partial counter updates must not erase the other scope, and startup
+        // configuration (effect/currency only) must not erase live inventory.
+        merged[key] = { ...merged[key], ...booster };
+      }
+    }
+    return merged;
   }
 
   function expectedActionScore(action) {
@@ -1689,7 +1741,8 @@
     LiveDraftPlanner,
     livePlannerWorkerSource,
     clampPanelPosition,
-    freeRetryAvailable,
+    retryAvailability,
+    mergeRetryBoosters,
     chooseScoreAdvice,
     compareForecastActions,
     liveExpectedFinalScore,
@@ -1751,6 +1804,8 @@
   }
   window.fetch = (...args) => {
     discoverDatasetUrl(args[0]);
+    const requestedSessionId = runtime.dealtSessionId;
+    const requestedCellSeq = runtime.dealtCell?.seq;
     const request = nativeFetch(...args);
     request
       .then((response) => {
@@ -1767,12 +1822,13 @@
           /\/game-session\/api\/v(?:3|4)\/session\/spin(?:$|[?#])/i.test(
             response.url,
           );
+        const isDealtState = /\/game-session\/api\/v(?:3|4)\/session\//i.test(response.url);
         let isVaultyApi = false;
         try {
           isVaultyApi =
             new URL(response.url).hostname === "api.vaultystudios.com";
         } catch (_) {}
-        if (!isSeededStart && !isDealtStart && !isDealtSpin && !isVaultyApi)
+        if (!isSeededStart && !isDealtState && !isVaultyApi)
           return;
         response
           .clone()
@@ -1780,10 +1836,22 @@
           .then((payload) => {
             captureOfficialResult(payload);
             const isV4 = /\/api\/v4\//i.test(response.url);
+            if (isDealtState && !isDealtStart && requestedSessionId &&
+                requestedSessionId !== runtime.dealtSessionId) return;
             if (isDealtSpin) captureDealtSpin(payload, isV4);
             else if (isDealtStart) captureDealtSession(payload, isV4);
             else if (isSeededStart)
               captureStudioSession(payload, observedDatasetUrl);
+            if (isDealtState && runtime.liveDataMode && runtime.dealtCell) {
+              const seq = payload?.cell?.seq ?? payload?.seq;
+              if (seq != null && Number(seq) < runtime.dealtCell.seq) return;
+              if (seq == null && requestedCellSeq !== runtime.dealtCell.seq) return;
+              const boosters = mergeRetryBoosters(runtime.dealtCell.boosters, payload);
+              if (JSON.stringify(boosters) !== JSON.stringify(runtime.dealtCell.boosters)) {
+                runtime.dealtCell.boosters = boosters;
+                if (document.body) scheduleScan(0);
+              }
+            }
           })
           .catch(() => {});
       })
@@ -2426,6 +2494,7 @@
     const cell = isV4 ? normalizeDealtCell(payload?.cell) : payload?.cell;
     if (!cell || !Number.isFinite(Number(cell.seq)) || !cell.team ||
         !ERAS.has(cell.era) || !Array.isArray(cell.squad)) return;
+    if (runtime.dealtCell && Number(cell.seq) < runtime.dealtCell.seq) return;
     cancelLiveAnalysis();
     if (isV4) {
       runtime.liveDataMode = true;
@@ -2450,7 +2519,7 @@
       era: String(cell.era),
       squad: cell.squad.map((player) => ({ ...player })),
       legal: Array.isArray(cell.legal) ? [...cell.legal] : [],
-      boosters: cell.boosters || null,
+      boosters: mergeRetryBoosters(runtime.dealtCell?.boosters, payload),
     };
     runtime.lastAnalysisKey = "";
     runtime.lastAnalysis = null;
@@ -4091,9 +4160,10 @@
   function renderLiveAdvice(cell, entries, retries) {
     const rows = currentRowsForCell(cell);
     const missing = (runtime.dealtCell?.squad.length || 0) - rows.length;
-    const freeRetry = (scope) => freeRetryAvailable(retries[scope],
-      runtime.dealtCell?.boosters?.[`respin_${scope}`]);
-    const available = { team: freeRetry("team"), era: freeRetry("era") };
+    const retryStates = Object.fromEntries(["team", "era"].map((scope) => [scope,
+      retryAvailability(retries[scope], runtime.dealtCell?.boosters?.[`respin_${scope}`])]));
+    const available = { team: retryStates.team.available, era: retryStates.era.available,
+      purchase: { team: retryStates.team.purchase, era: retryStates.era.purchase } };
     const analysisKey = JSON.stringify([runtime.dealtCell?.seq, cell.team, cell.era,
       entries.map((entry) => [entry.row.key, entry.position]), available,
       rows.map((row) => row.key), runtime.rows.length]);
@@ -4119,13 +4189,19 @@
     // retries just because no current player can be scored (common in Hoop IQ).
     const incompleteOffer = missing > 0 && !best;
     const isRetry = !incompleteOffer && (advice.kind === "team" || advice.kind === "era");
+    const purchaseRetry = isRetry && retryStates[advice.kind].purchase;
     const move = !isRetry && best?.moves[0];
     const color = isRetry ? COLORS[advice.kind] : move ? COLORS.position : best ? COLORS.pick : COLORS.team;
     const target = runtime.oneVsOneOpponent?.score;
     const status = incompleteOffer ? "Stats needed to compare this roll" : Number.isFinite(target)
       ? `Highest-score planning · bot ${target.toFixed(1)}`
-      : isRetry ? "Retry recommended before picking" : "Best modeled draft route";
-    const outlook = live82Outlook(advice, entries, missing, readResultHistory());
+      : purchaseRetry ? "Optional purchase may improve score" :
+        isRetry ? "Retry recommended before picking" : "Best modeled draft route";
+    // An optional purchase must not improve the displayed outlook before the
+    // user buys it. Keep that indicator on the best no-purchase route, which
+    // may use a different free/owned retry rather than pick immediately.
+    const outlook = live82Outlook(purchaseRetry ? { ...advice, kind: advice.withoutPurchaseKind } : advice,
+      entries, missing, readResultHistory());
     const outlookColor = outlook.state === "promising" ? COLORS.pick :
       outlook.state === "unlikely" ? COLORS.team : COLORS.muted;
     const action = isRetry ? `Reroll ${advice.kind === "team" ? "TEAM" : "ERA"}` : move
@@ -4134,7 +4210,11 @@
       : missing > 0 ? "Player stats are hidden" : "No available player fits";
     const position = isRetry ? null : move?.to || best?.position;
     const route = isRetry
-      ? `Use your free ${advice.kind} retry. Its estimated benefit outweighs saving it for later.`
+      ? purchaseRetry
+        ? "Purchase required. Consider this only if you can afford it and want to spend coins; the best no-purchase option is below."
+        : `${{ free: "Use your free retry", owned: "Use an owned retry token",
+          rv: "Watch the site's ad to retry", coins: "Coins required for this retry",
+          unknown: "Check the site's retry cost before proceeding" }[retryStates[advice.kind].source]}. Its estimated benefit outweighs saving it for later.`
       : move ? [
       ...best.moves.slice(1).map((step) =>
         `move ${step.player} ${step.from} → ${step.to}`),
@@ -4147,18 +4227,30 @@
     const unknown = missing > 0
       ? `<div class="filter-hint">${missing} offered player${missing === 1 ? " has" : "s have"} unknown stats; ${best ? "this suggestion covers known players only" : "an accurate pick comparison is unavailable"}.</div>` : "";
     const finalRound = entries.length === 4;
-    const forecastText = (scope) => !available[scope] ? "no free retry" :
-      incompleteOffer ? "cannot compare without player stats" :
-      advice.forecasts[scope] === null ? "not enough samples" :
+    const noPurchaseRetry = ["team", "era"].includes(advice.withoutPurchaseKind)
+      ? advice.withoutPurchaseKind : null;
+    const fallbackText = purchaseRetry && noPurchaseRetry
+      ? `Without buying: reroll ${noPurchaseRetry.toUpperCase()} (${retryStates[noPurchaseRetry].label}).`
+      : best ? `${purchaseRetry ? "Without buying" : "If you prefer to pick"}: ${best.row.player} → ${best.position}${best.moves.length ? " (requires a lineup move)" : ""}.`
+        : "Without buying: no known player in this offer fits your lineup.";
+    const forecastText = (scope) => {
+      const state = retryStates[scope];
+      if (!state.available && !state.purchase) return state.label;
+      const comparison = incompleteOffer ? "cannot compare without player stats" :
+        advice.forecasts[scope] === null ? "not enough samples" :
         best ? `${(advice.forecasts[scope] - best.value) >= 0 ? "+" : ""}${(advice.forecasts[scope] - best.value).toFixed(1)} estimated score vs pick` : "retry to find a legal pick";
+      return `${state.label} · ${comparison}${state.purchase ? " (if purchased)" : ""}`;
+    };
     const compactRetryText = (scope) => {
-      if (!available[scope]) return "no free retry";
-      if (incompleteOffer) return "stats unknown";
-      if (advice.forecasts[scope] === null) return "insufficient data";
-      if (!best) return "find a legal pick";
+      const state = retryStates[scope];
+      if (!state.available && !state.purchase) return state.label;
+      if (incompleteOffer) return `${state.label} · stats unknown`;
+      if (advice.forecasts[scope] === null) return `${state.label} · insufficient data`;
+      if (!best) return `${state.label} · find a legal pick`;
       const delta = advice.forecasts[scope] - best.value;
-      return Math.abs(delta) < 0.05 ? delta > EPSILON ? "+<0.1 pts" : "≈0 pts" :
+      const gain = Math.abs(delta) < 0.05 ? delta > EPSILON ? "+<0.1 pts" : "≈0 pts" :
         `${delta > 0 ? "+" : ""}${delta.toFixed(1)} pts`;
+      return `${state.label} · ${gain}`;
     };
     const details = readUiState().details ? `<div class="details">
       <div class="row"><span>Picked team</span><strong>${entries.length}/5</strong></div>
@@ -4167,22 +4259,22 @@
       <div class="row"><span>Era retry</span><strong>${forecastText("era")}</strong></div>
       <div class="row"><span>Method</span><strong>Flexible-roster score planning</strong></div>
       <div class="row"><span>Objective · version</span><strong>Highest final score · ${VERSION}</strong></div>
-      ${Number.isFinite(outlook.forecast) ? `<div class="row"><span>Estimated final score</span><strong>${outlook.forecast.toFixed(1)}</strong></div>` : ""}
+      ${Number.isFinite(outlook.forecast) ? `<div class="row"><span>${purchaseRetry ? "Forecast without purchase" : "Estimated final score"}</span><strong>${outlook.forecast.toFixed(1)}</strong></div>` : ""}
       ${entries.length >= 3 ? '<div class="row"><span>Scoring</span><strong>Complete-team formula</strong></div>' : ""}
       <div class="row"><span>Planning samples</span><strong>${advice.sampleCount} team/era pools</strong></div>
       <div class="sub">${escapeHtml(outlook.explanation)}</div>
-      <div class="sub">Retry gains compare using a free retry now with picking and keeping it for later. The bot's score never changes this score-first objective. Samples are estimates, not known future rolls.</div>
+      <div class="sub">Retry gains compare using the next available retry now with picking and keeping it for later. Purchase options are conditional quotes for buying one retry now, not assumed inventory or affordability. The coach never buys, watches ads, or uses tokens for you. The bot's score never changes this score-first objective. Samples are estimates, not known future rolls.</div>
       </div>` : "";
     renderPanel(`<div class="status" style="--status:${color}"><span class="dot"></span><span>${escapeHtml(status)}</span></div>
       <div class="outlook" data-state="${outlook.state}" title="${escapeHtml(outlook.explanation)}" style="--status:${outlookColor}"><span class="dot"></span><span>${escapeHtml(outlook.label)}</span></div>
-      <div class="action" style="--action:${color}"><div class="eyebrow">${isRetry ? "REROLL NOW" : move ? "MOVE FIRST" : best ? "PICK NOW" : "ROLL GUIDANCE"}</div>
+      <div class="action" style="--action:${color}"><div class="eyebrow">${purchaseRetry ? "CONSIDER RETRY" : isRetry ? "REROLL NOW" : move ? "MOVE FIRST" : best ? "PICK NOW" : "ROLL GUIDANCE"}</div>
       <div class="primary"><span class="name">${escapeHtml(action)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
       <div class="sub">${escapeHtml(route)}</div>
       ${finalRound && best && !isRetry ? `<div class="metrics"><span>Calculated final score</span><strong>${best.result.score.toFixed(1)}</strong></div>` : ""}</div>
-      ${unknown}${isRetry && best ? `<div class="fallback">If you prefer to pick: ${escapeHtml(best.row.player)} → ${best.position}${best.moves.length ? " (requires a lineup move)" : ""}.</div>` : ""}
-      <div class="retry-summary" title="Estimated final-score change from using the free retry now instead of picking and keeping it for later"><span>Team: ${compactRetryText("team")}</span><span>Era: ${compactRetryText("era")}</span></div>
+      ${unknown}${isRetry && (best || purchaseRetry) ? `<div class="${purchaseRetry ? "filter-hint" : "fallback"}">${escapeHtml(fallbackText)}</div>` : ""}
+      <div class="retry-summary" title="Estimated score change from retrying now. Purchase-option estimates apply only if you buy the retry; the coach does not assume you can afford it."><span>Team: ${compactRetryText("team")}</span><span>Era: ${compactRetryText("era")}</span></div>
       <button class="details-toggle" id="details-toggle">${readUiState().details ? "Hide details" : "Why this choice?"}</button>${details}`,
-      `live:${analysisKey}:${advice.kind}:${best?.row.id}:${best?.position}:${JSON.stringify(best?.moves)}:${missing}:${outlook.state}:${outlook.reference}:${readUiState().details}`);
+      `live:${analysisKey}:${JSON.stringify(retryStates)}:${advice.kind}:${best?.row.id}:${best?.position}:${JSON.stringify(best?.moves)}:${missing}:${outlook.state}:${outlook.reference}:${readUiState().details}`);
   }
 
   function renderAdvice(advice, entries, cards, retries) {

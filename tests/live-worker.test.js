@@ -30,8 +30,11 @@ async function main() {
       const entries = [];
       for (let round = 0; round < 5; round += 1) {
         const cell = pools[(game * 17 + round * 9) % pools.length];
-        for (const [team, era] of [[false, false], [false, true], [true, false], [true, true]]) {
-          const input = { pools, entries, rows: cell.rows, cell, retries: { team, era } };
+        for (const retries of [{ team: false, era: false }, { team: false, era: true },
+          { team: true, era: false }, { team: true, era: true },
+          { team: false, era: false, purchase: { team: true, era: true } },
+          { team: true, era: false, purchase: { team: false, era: true } }]) {
+          const input = { pools, entries, rows: cell.rows, cell, retries };
           const expected = new LiveDraftPlanner(pools, entries).advise(input.rows, cell, input.retries);
           const actual = await run(input);
           assert.deepEqual(actual.advice, expected,

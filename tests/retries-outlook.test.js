@@ -1,21 +1,54 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { freeRetryAvailable, chooseScoreAdvice, compareForecastActions, live82Outlook,
+const { retryAvailability, mergeRetryBoosters, chooseScoreAdvice, compareForecastActions, live82Outlook,
   liveExpectedFinalScore, legacy82Outlook, LiveDraftPlanner, livePriorPools, rawTeamScore,
   POSITIONS } = require("../82-0-advisor.user.js");
 
 for (const mode of ["classic", "hoopiq", "1v1"]) {
-  assert.equal(freeRetryAvailable({ available: true }, { enabled: true, next_use: "free", free_left: 1 }), true, mode);
-  assert.equal(freeRetryAvailable({ available: false }, { enabled: true, next_use: "free", free_left: 1 }), false, mode);
-  assert.equal(freeRetryAvailable({ available: true }, { enabled: false, next_use: "free", free_left: 1 }), false, mode);
-  for (const next_use of ["coins", "owned", "rv", "none"]) {
-    assert.equal(freeRetryAvailable({ available: true }, { next_use, free_left: 1 }), false,
-      "must not advise an inventory, ad, or paid retry as free");
+  const ready = { available: true };
+  assert.deepEqual(retryAvailability(ready, { enabled: true, next_use: "free", free_left: 1 }),
+    { source: "free", label: "free", available: true, purchase: false }, mode);
+  assert.equal(retryAvailability({ available: false }, { next_use: "free", free_left: 1 }).label, "not ready", mode);
+  assert.equal(retryAvailability(ready, { enabled: false, next_use: "free", free_left: 1 }).available, false, mode);
+  for (const next_use of ["owned", "rv"]) {
+    const result = retryAvailability(ready, { next_use, free_left: 0 });
+    assert.equal(result.available, true, "owned/ad retries must not be silently excluded");
+    assert.equal(result.source, next_use);
+    assert.notEqual(result.label, "free");
   }
-  assert.equal(freeRetryAvailable({ available: true }, { next_use: "free", free_left: 0 }), false);
-  assert.equal(freeRetryAvailable({ available: true }, null), true);
+  for (const next_use of ["coins", "none"]) {
+    const result = retryAvailability(ready, { next_use, free_left: 0 });
+    assert.equal(result.purchase, true);
+    assert.equal(result.available, false, "purchase opportunities are not assumed funded inventory");
+  }
+  assert.equal(retryAvailability(ready, { next_use: "free", free_left: 0 }).available, true,
+    "explicit next_use matches the site's readiness check even if a counter is stale");
+  for (const metadata of [null, {}, { effect: "respin", currency: "booster_respin_team" }]) {
+    const result = retryAvailability(ready, metadata);
+    assert.equal(result.available, true, "absent/config-only metadata must not override an enabled button");
+    assert.equal(result.source, "unknown");
+    assert.ok(result.label.includes("check cost"), "never falsely promise an unknown retry is free");
+  }
+  assert.equal(retryAvailability(ready, { owned_left: 2, free_left: 0 }).source, "owned");
+  assert.equal(retryAvailability(ready, { next_use: "free" }).available, true,
+    "explicit free source still works when the counter is omitted");
+  assert.equal(retryAvailability(ready, { next_use: "none", used_coins: 1, coins_per_draft: 1,
+    used_in_draft: 1, max_per_draft: 6 }).purchase, false, "coin cap supersedes the overall draft cap");
+  assert.equal(retryAvailability(ready, { next_use: "none", used_coins: 0, coins_per_draft: 1,
+    used_in_draft: 6, max_per_draft: 6 }).purchase, true, "split coin counters match the public frontend");
+  assert.equal(retryAvailability(ready, { next_use: "none", max_per_draft: 1, used_in_draft: 1 }).purchase, false);
 }
+
+const counters = { respin_team: { next_use: "free", free_left: 1 },
+  respin_era: { next_use: "owned", owned_left: 2, free_left: 0 } };
+assert.deepEqual(mergeRetryBoosters(counters, { boosters: { respin_team: { effect: "respin" } } }), counters);
+const updated = mergeRetryBoosters(counters, { boosters: { respin_team: { free_left: 0, next_use: "none" } } });
+assert.equal(updated.respin_team.next_use, "none");
+assert.deepEqual(updated.respin_era, counters.respin_era, "a partial update retains the other scope");
+assert.equal(counters.respin_team.free_left, 1, "metadata merging must not mutate the original");
+assert.equal(mergeRetryBoosters(updated, { data: { cell: { boosters: {
+  respin_team: { next_use: "owned", owned_left: 1 } } } } }).respin_team.next_use, "owned");
 
 const current = { best: { forecastRaw: 100, forecastMatchupRate: 0.2, forecastPathRate: 0.1 } };
 const team = { scope: "team", meanRaw: 102, legalCount: 5, matchupRate: 0.1, pathRate: 0.1 };
@@ -72,6 +105,23 @@ assert.ok(Math.abs(liveExpectedFinalScore(advice, entries) - rawTeamScore([...en
 const early = entries.slice(0, 2);
 const earlyPlanner = new LiveDraftPlanner(pools, early);
 const earlyAdvice = earlyPlanner.advise([row("Incoming", 4)], pools[0], { team: false, era: false });
+const purchaseAdvice = new LiveDraftPlanner(pools, early).advise([row("Incoming", 4)], pools[0],
+  { team: false, era: false, purchase: { team: true, era: true } });
+assert.deepEqual(purchaseAdvice.best, earlyAdvice.best,
+  "purchase quotes cannot change a pick by inventing future purchased inventory");
+assert.equal(purchaseAdvice.forecasts.team,
+  earlyPlanner.retryExpectation(earlyPlanner.state(earlyPlanner.initialFamily, 0, 0).table, pools[0], "team"));
+assert.equal(purchaseAdvice.forecasts.era,
+  earlyPlanner.retryExpectation(earlyPlanner.state(earlyPlanner.initialFamily, 0, 0).table, pools[0], "era"));
+assert.equal(earlyAdvice.forecasts.team, null, "quotes must not mutate no-purchase advice");
+assert.equal(purchaseAdvice.withoutPurchaseKind, earlyAdvice.kind);
+const ownedAdvice = new LiveDraftPlanner(pools, early).advise([row("Incoming", 4)], pools[0],
+  { team: false, era: true });
+const mixedAdvice = new LiveDraftPlanner(pools, early).advise([row("Incoming", 4)], pools[0],
+  { team: false, era: true, purchase: { team: true } });
+assert.equal(mixedAdvice.withoutPurchaseKind, ownedAdvice.kind,
+  "the best no-purchase alternative includes any usable free/owned retry, not just a pick");
+assert.deepEqual(mixedAdvice.best, ownedAdvice.best);
 assert.ok(Math.abs(liveExpectedFinalScore(earlyAdvice, early) -
   earlyAdvice.best.value - early.reduce((sum, e) => sum + earlyPlanner.value(e.row), 0)) < 1e-8,
   "early outlook must reuse planner defense denominators, not inflated partial-team scores");
@@ -87,4 +137,4 @@ assert.equal(legacy82Outlook({ seededPlan: { result: { possible82: true } } }).s
 assert.equal(legacy82Outlook({ seededPlan: { result: { possible82: false } } }).state, "impossible");
 assert.equal(legacy82Outlook({ priorCeiling: {} }).state, "uncertain",
   "an absent proof flag is not proof of impossibility");
-console.log("Retry and outlook tests passed: score-only objective, free-budget safety, and honest cross-mode 82-0 estimates.");
+console.log("Retry and outlook tests passed: score-only objective, funding sources, partial metadata, conditional purchase quotes, and honest cross-mode 82-0 estimates.");
