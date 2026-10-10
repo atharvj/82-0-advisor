@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.9.0
+// @version      2.9.1
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.9.0";
+  const VERSION = "2.9.1";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -2226,6 +2226,7 @@
     opponentPlayerIds: new Set(),
     currentVisibleRows: [],
     resultRecorded: false,
+    resultHistoryId: null,
     modelMismatch: safeSessionGet(MISMATCH_KEY) === "1",
     mode: safeSessionGet(MODE_KEY) || "classic",
   };
@@ -2256,6 +2257,8 @@
       const display = root?.score_display;
       if (!display || typeof display !== "object") continue;
       const values = display.values || display.detail || display;
+      if (values?.wins == null || values.wins === "" ||
+          values?.losses == null || values.losses === "") continue;
       const wins = Number(values?.wins);
       const losses = Number(values?.losses);
       if (
@@ -2263,10 +2266,11 @@
         !Number.isInteger(losses) ||
         wins < 0 ||
         losses < 0 ||
-        wins + losses !== 82
+        wins > 82 || losses > 82 ||
+        wins + losses <= 0 || wins + losses > 82
       )
         continue;
-      const score = Number(root?.score);
+      const score = root?.score == null || root.score === "" ? NaN : Number(root.score);
       runtime.officialResult = {
         wins,
         losses,
@@ -2332,27 +2336,32 @@
   }
 
   function recordCompletedGame(result, score) {
-    if (runtime.resultRecorded || !result) return readResultHistory();
+    if (!result) return readResultHistory();
     const sessionId =
       runtime.dealtSessionId || runtime.sessionPayload?.session_id || null;
     const pickSignature = [...runtime.tracked.values()]
       .map((tracked) => tracked.row.key)
       .sort()
       .join(";");
-    const id =
+    const id = runtime.resultHistoryId || (
       sessionId ||
-      `${runtime.mode}:${result.wins}:${Number.isFinite(score) ? score : "-"}:${hashText(pickSignature)}`;
+      `${runtime.mode}:${result.wins}:${Number.isFinite(score) ? score : "-"}:${hashText(pickSignature)}`);
+    runtime.resultHistoryId = id;
     const history = readResultHistory();
-    if (!history.some((entry) => entry.id === id)) {
-      history.push({
-        id,
-        at: Date.now(),
-        version: VERSION,
-        protocol: runtime.liveDataMode ? "v4" : "legacy",
-        mode: runtime.mode,
-        wins: result.wins,
-        score: Number.isFinite(score) ? score : null,
-      });
+    const existing = history.findIndex((entry) => entry.id === id);
+    const updated = {
+      id,
+      at: existing >= 0 ? history[existing].at : Date.now(),
+      version: VERSION,
+      protocol: runtime.liveDataMode ? "v4" : "legacy",
+      mode: runtime.mode,
+      wins: result.wins,
+      losses: result.losses,
+      score: Number.isFinite(score) ? score : null,
+    };
+    if (existing < 0 || JSON.stringify(history[existing]) !== JSON.stringify(updated)) {
+      if (existing < 0) history.push(updated);
+      else history[existing] = updated;
       writeResultHistory(history);
     }
     runtime.resultRecorded = true;
@@ -4805,6 +4814,20 @@
   }
 
   function officialRecordFromPage() {
+    // The current result card has no "Projected Record" label. Its counters
+    // animate, so only read it once the site's result buttons are revealed.
+    const modern = [...document.querySelectorAll(".classic-result-record")]
+      .find(isVisible);
+    if (modern) {
+      const root = modern.closest("[data-classic-result]");
+      if (root && !root.hasAttribute("data-buttons")) return null;
+      const match = (modern.textContent || "").trim().match(/^(\d{1,2})\s*[-–—]\s*(\d{1,2})$/);
+      if (!match) return null;
+      const wins = Number(match[1]), losses = Number(match[2]);
+      if (wins <= 82 && losses <= 82 && wins + losses > 0 && wins + losses <= 82)
+        return { wins, losses, score: officialScoreFromPage() };
+      return null;
+    }
     const labels = [...document.querySelectorAll("span,p,div")].filter(
       (element) =>
         isVisible(element) &&
@@ -4819,7 +4842,8 @@
         for (const match of text.matchAll(/\b(\d{1,2})\s*[-–—]\s*(\d{1,2})\b/g)) {
           const wins = Number(match[1]);
           const losses = Number(match[2]);
-          if (wins + losses === 82) return { wins, losses, score: null };
+          if (wins <= 82 && losses <= 82 && wins + losses > 0 && wins + losses <= 82)
+            return { wins, losses, score: officialScoreFromPage(container) };
         }
         container = container.parentElement;
       }
@@ -4827,8 +4851,17 @@
     return null;
   }
 
-  function officialScoreFromPage() {
-    for (const element of document.querySelectorAll("span,p")) {
+  function officialScoreFromPage(container = document) {
+    const modern = [...container.querySelectorAll(".classic-result-pts")].find(isVisible);
+    if (modern) {
+      const root = modern.closest("[data-classic-result]");
+      if (root && !root.hasAttribute("data-buttons")) return null;
+      const value = (modern.textContent || "").trim();
+      if (!/^[\d,.]+$/.test(value)) return null;
+      const score = Number(value.replaceAll(",", ""));
+      return Number.isFinite(score) && score >= 0 && score <= 200 ? score : null;
+    }
+    for (const element of container.querySelectorAll("span,p")) {
       if (!isVisible(element)) continue;
       const match = directText(element).match(/^([\d,.]+)\s*pts$/i);
       if (!match) continue;
@@ -4844,8 +4877,11 @@
     clearHighlights();
     const rows = [...runtime.tracked.values()].map((tracked) => tracked.row);
     const calculated = rows.length === 5 ? calculateTeamResult(rows) : null;
-    const official = runtime.officialResult || officialRecordFromPage();
-    if (runtime.liveDataMode && !official) {
+    const pageResult = officialRecordFromPage();
+    const animatingResult = [...document.querySelectorAll("[data-classic-result]")]
+      .some((root) => isVisible(root) && !root.hasAttribute("data-buttons"));
+    const official = animatingResult ? null : pageResult || runtime.officialResult;
+    if ((runtime.liveDataMode || animatingResult) && !official) {
       renderPanel(`<div class="status" style="--status:${COLORS.muted}"><span class="dot"></span><span>Final team</span></div>
         <div class="action" style="--action:${COLORS.muted}"><div class="eyebrow">FINAL RESULT</div>
         <div class="primary"><span class="name">${calculated ? `${calculated.score.toFixed(1)} calculated score` : "Waiting for result"}</span></div>
@@ -4862,10 +4898,11 @@
     }
     const displayed = official || calculated;
     const officialScore = runtime.officialResult?.score;
-    const pageScore = officialScoreFromPage();
-    const score = Number.isFinite(officialScore)
-      ? officialScore
-      : calculated?.score ?? pageScore;
+    const pageScore = pageResult?.score ?? officialScoreFromPage();
+    // Match the settled site display (including its score rounding). Keep the
+    // precise returned score for 1v1 comparisons and local calibration.
+    const score = runtime.mode !== "1v1" && Number.isFinite(pageScore) ? pageScore
+      : Number.isFinite(officialScore) ? officialScore : pageScore ?? calculated?.score;
     const opponentScore = runtime.oneVsOneOpponent?.score;
     const isOneVsOneResult =
       runtime.mode === "1v1" &&
@@ -4886,17 +4923,14 @@
         : COLORS.impossible;
     const sourceLine = isOneVsOneResult
       ? official
-        ? calculated
-          ? "1v1 result from 82-0 · your score checked from all five selected peaks."
-          : "1v1 result shown by 82-0."
+        ? "1v1 result from 82-0."
         : "Matchup projected from your five peaks and the bot score supplied with this session."
       : official
-        ? calculated
-          ? "Final result from 82-0 · score checked from all five selected peaks."
-          : "Final result shown by 82-0."
+        ? "Final result shown by 82-0."
         : "Record projected with the current 82-0 curve; score exactly recomputed from all five peaks.";
     const historySummary = official
-      ? resultHistorySummary(recordCompletedGame(displayed, score))
+      ? resultHistorySummary(recordCompletedGame(displayed,
+        Number.isFinite(officialScore) ? officialScore : score))
       : "";
     const resultStatus = isOneVsOneResult
       ? verdict === "win"
@@ -4913,7 +4947,7 @@
     renderPanel(
       `<div class="status" style="--status:${color}"><span class="dot"></span><span>${resultStatus}</span></div>
        <div class="action" style="--action:${color}"><div class="eyebrow">${isOneVsOneResult ? "YOU · BOT" : "FINAL RESULT"}</div><div class="primary"><span class="name">${resultPrimary}</span></div><div class="sub">${escapeHtml(sourceLine)}${historySummary ? `<br>${escapeHtml(historySummary)}` : ""}</div></div>`,
-      `result:${score}:${displayed.wins}:${runtime.mode}:${opponentScore}:${official ? "official" : "projected"}`,
+      `result:${score}:${displayed.wins}:${displayed.losses}:${runtime.mode}:${opponentScore}:${official ? "official" : "projected"}:${historySummary}`,
     );
     if (calculated) checkModelDrift(calculated);
     return true;
@@ -4921,11 +4955,10 @@
 
   function checkModelDrift(calculated) {
     if (runtime.modelMismatch) return;
-    let displayed = null;
-    if (runtime.mode === "1v1") {
-      displayed = runtime.officialResult?.score;
-      if (!Number.isFinite(displayed)) return;
-    } else {
+    let displayed = runtime.officialResult?.score;
+    let tolerance = 0.11;
+    if (!Number.isFinite(displayed)) {
+      if (runtime.mode === "1v1") return;
       const candidates = [];
       for (const element of document.querySelectorAll("span,p")) {
         const text = directText(element);
@@ -4937,8 +4970,11 @@
       }
       if (candidates.length !== 1) return;
       displayed = candidates[0];
+      // An integer score on the page is rounded; it is not an exact formula
+      // disagreement with a fractional calculated score.
+      if (Number.isInteger(displayed)) tolerance = 0.51;
     }
-    if (Math.abs(displayed - calculated.score) <= 0.11) {
+    if (Math.abs(displayed - calculated.score) <= tolerance) {
       runtime.resultMismatchCandidate = null;
       return;
     }
@@ -4997,6 +5033,7 @@
     runtime.opponentPlayerIds = new Set();
     runtime.currentVisibleRows = [];
     runtime.resultRecorded = false;
+    runtime.resultHistoryId = null;
     runtime.sessionPayload = null;
     runtime.dealtSessionId = null;
     runtime.dealtCell = null;
@@ -5445,7 +5482,7 @@
       characterData: true,
       attributes: true,
       attributeFilter: ["disabled", "aria-disabled", "data-selectable", "aria-label",
-        "data-position", "data-court-slot"],
+        "data-position", "data-court-slot", "data-classic-result", "data-buttons"],
     });
 
     renderLoading("Coach ready — start a draft and spin to load player stats.");
