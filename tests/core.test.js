@@ -25,6 +25,7 @@ const {
   extendRosterFamily,
   reachableRosterStates,
   shortestPlacementPlan,
+  lineupInstructionSteps,
   controlPosition,
   readCourtRoster,
   placementPlanIsLegal,
@@ -611,6 +612,14 @@ assert.deepEqual(
   "the BFS must find a two-step augmenting path",
 );
 assert.equal(augmentingPlan.position, "PG");
+assert.deepEqual(lineupInstructionSteps({ ...augmentingPlan, row: moveCandidate }), [
+  "Move B from SG to SF (empty).",
+  "Move A from PG to SG (empty).",
+  "Pick Candidate and place him at PG.",
+], "instructions must include prerequisite moves before freeing the incoming player's slot");
+assert.deepEqual(lineupInstructionSteps({ row: moveCandidate, position: "PG", moves: [] }),
+  ["Pick Candidate and place him at PG."]);
+assert.deepEqual(lineupInstructionSteps(null), []);
 
 const loopData = normalizeDataset([
   row("Luka Doncic", "DAL", "2020s", ["PG", "SG", "SF"], 30, 9, 9, 1, 0.5),

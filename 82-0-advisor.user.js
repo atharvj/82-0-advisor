@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         82-0 Perfect Team Coach
 // @namespace    https://82-0.com/
-// @version      2.8.1
+// @version      2.8.2
 // @description  Match-aware live draft optimization, positions, retries, and 82-0 guidance for Classic, Hoop IQ, and 1v1.
 // @author       Intellectual07
 // @license      MIT
@@ -14,7 +14,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.8.1";
+  const VERSION = "2.8.2";
   const MODEL_VERIFIED = "2026-09-23";
   const PANEL_ID = "__82coach_host__";
   const DATASET_WAIT_MS = 15_000;
@@ -1586,6 +1586,15 @@
       y: clamp(position.y, viewportHeight - height - 8) };
   }
 
+  function lineupInstructionSteps(best) {
+    if (!best?.row || !best.position) return [];
+    return [
+      ...(best.moves || []).map((move) =>
+        `Move ${move.player} from ${move.from} to ${move.to} (empty).`),
+      `Pick ${best.row.player} and place him at ${best.position}.`,
+    ];
+  }
+
   function retryAvailability(button, booster) {
     const status = (source, label, available = false, purchase = false) =>
       ({ source, label, available, purchase });
@@ -1754,6 +1763,7 @@
     positionMask,
     reachableRosterStates,
     shortestPlacementPlan,
+    lineupInstructionSteps,
     controlPosition,
     readCourtRoster,
     placementPlanIsLegal,
@@ -2162,6 +2172,9 @@
         .route-step { display:grid; grid-template-columns:20px 1fr; gap:5px; padding:2px 0; }
         .route-step span { color:#64748b; font-weight:800; }
         .route-step strong { min-width:0; color:#b8c6d6; font-weight:600; overflow-wrap:anywhere; }
+        .lineup-steps { margin:5px 0 0; padding-left:18px; font-size:10px; line-height:1.4; }
+        .lineup-steps li { padding:2px 0; overflow-wrap:anywhere; }
+        .lineup-steps li::marker { color:#7dd3fc; font-weight:800; }
         .fallback { margin-top:7px; padding:6px 7px; border-radius:7px; background:#0c1726; color:#9aacbf; }
         .fallback strong { color:#e7eef7; }
         .filter-hint { margin-top:7px; padding:6px 7px; border-radius:7px; background:#17233a; color:#bfdbfe; }
@@ -4157,6 +4170,13 @@
     } catch (_) { fallback(); }
   }
 
+  function renderLineupSteps(best) {
+    if (!best?.moves?.length) return "";
+    return `<div class="lineup-route"><div class="sub">Follow in order; each destination is empty at that step:</div>
+      <ol class="lineup-steps" aria-label="Lineup move steps">${lineupInstructionSteps(best)
+        .map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol></div>`;
+  }
+
   function renderLiveAdvice(cell, entries, retries) {
     const rows = currentRowsForCell(cell);
     const missing = (runtime.dealtCell?.squad.length || 0) - rows.length;
@@ -4215,11 +4235,7 @@
         : `${{ free: "Use your free retry", owned: "Use an owned retry token",
           rv: "Watch the site's ad to retry", coins: "Coins required for this retry",
           unknown: "Check the site's retry cost before proceeding" }[retryStates[advice.kind].source]}. Its estimated benefit outweighs saving it for later.`
-      : move ? [
-      ...best.moves.slice(1).map((step) =>
-        `move ${step.player} ${step.from} → ${step.to}`),
-      `pick ${best.row.player} → ${best.position}`,
-    ].join("; then ") : best
+      : move ? `Free ${best.position} for ${best.row.player} using the steps below.` : best
       ? `${best.row.ppg.toFixed(1)} PTS · ${best.row.rpg.toFixed(1)} REB · ${best.row.apg.toFixed(1)} AST · ${best.row.spg.toFixed(1)} STL · ${best.row.bpg.toFixed(1)} BLK`
       : missing > 0
         ? "This roll has no known stats yet. Classic rolls saved in this browser can provide stats for Hoop IQ."
@@ -4231,8 +4247,10 @@
       ? advice.withoutPurchaseKind : null;
     const fallbackText = purchaseRetry && noPurchaseRetry
       ? `Without buying: reroll ${noPurchaseRetry.toUpperCase()} (${retryStates[noPurchaseRetry].label}).`
-      : best ? `${purchaseRetry ? "Without buying" : "If you prefer to pick"}: ${best.row.player} → ${best.position}${best.moves.length ? " (requires a lineup move)" : ""}.`
+      : best ? `${purchaseRetry ? "Without buying" : "If you prefer to pick"}: ${best.row.player} → ${best.position}.`
         : "Without buying: no known player in this offer fits your lineup.";
+    const fallbackSteps = isRetry && best && !(purchaseRetry && noPurchaseRetry)
+      ? renderLineupSteps(best) : "";
     const forecastText = (scope) => {
       const state = retryStates[scope];
       if (!state.available && !state.purchase) return state.label;
@@ -4270,8 +4288,9 @@
       <div class="action" style="--action:${color}"><div class="eyebrow">${purchaseRetry ? "CONSIDER RETRY" : isRetry ? "REROLL NOW" : move ? "MOVE FIRST" : best ? "PICK NOW" : "ROLL GUIDANCE"}</div>
       <div class="primary"><span class="name">${escapeHtml(action)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
       <div class="sub">${escapeHtml(route)}</div>
+      ${move ? renderLineupSteps(best) : ""}
       ${finalRound && best && !isRetry ? `<div class="metrics"><span>Calculated final score</span><strong>${best.result.score.toFixed(1)}</strong></div>` : ""}</div>
-      ${unknown}${isRetry && (best || purchaseRetry) ? `<div class="${purchaseRetry ? "filter-hint" : "fallback"}">${escapeHtml(fallbackText)}</div>` : ""}
+      ${unknown}${isRetry && (best || purchaseRetry) ? `<div class="${purchaseRetry ? "filter-hint" : "fallback"}">${escapeHtml(fallbackText)}${fallbackSteps}</div>` : ""}
       <div class="retry-summary" title="Estimated score change from retrying now. Purchase-option estimates apply only if you buy the retry; the coach does not assume you can afford it."><span>Team: ${compactRetryText("team")}</span><span>Era: ${compactRetryText("era")}</span></div>
       <button class="details-toggle" id="details-toggle">${readUiState().details ? "Hide details" : "Why this choice?"}</button>${details}`,
       `live:${analysisKey}:${JSON.stringify(retryStates)}:${advice.kind}:${best?.row.id}:${best?.position}:${JSON.stringify(best?.moves)}:${missing}:${outlook.state}:${outlook.reference}:${readUiState().details}`);
@@ -4345,7 +4364,7 @@
       : "";
     const fallbackHtml =
       isRetry && best
-        ? `<div class="fallback">Best fallback if you override: <strong>${escapeHtml(best.row.player)} → ${best.position}</strong><br>${escapeHtml(stats)}</div>`
+        ? `<div class="fallback">Best fallback if you override: <strong>${escapeHtml(best.row.player)} → ${best.position}</strong><br>${escapeHtml(stats)}${renderLineupSteps(best)}</div>`
         : "";
     const recommendedCardVisible = best
       ? cards.some(
@@ -4433,18 +4452,8 @@
       if (occupiedMask(entries) & bit) return false;
       return advice.kind !== "pick" || move || openPosition !== best?.position;
     });
-    const remainingMoveRoute = move
-      ? [
-          ...(best.moves || [])
-            .slice(1)
-            .map((nextMove) =>
-              `move ${nextMove.player} ${nextMove.from} → ${nextMove.to}`,
-            ),
-          `pick ${best.row.player} → ${best.position}`,
-        ].join("; then ")
-      : "";
     const subline = move
-      ? `Then ${remainingMoveRoute}`
+      ? `Free ${best.position} for ${best.row.player} using the steps below.`
       : isRetry
         ? advice.reason
         : stats;
@@ -4455,6 +4464,7 @@
         <div class="eyebrow">${eyebrow}</div>
         <div class="primary"><span class="name">${escapeHtml(primary)}</span>${position ? `<span class="arrow">→</span><span class="position">${position}</span>` : ""}</div>
         <div class="sub">${escapeHtml(subline)}</div>
+        ${move ? renderLineupSteps(best) : ""}
         <div class="metrics"><span>${seededResult ? "Exact seeded final" : isRetry ? "Retry expected final" : "Expected final"}</span><strong>${escapeHtml(actionMetric)}</strong><span>${advice.kind === "pick" && !move ? "Open after pick" : "Open positions"}</span><strong>${escapeHtml(remainingAfterAction.join(" · ") || "Complete")}</strong></div>
       </div>
       ${fallbackHtml}
@@ -4470,6 +4480,7 @@
       player: best?.row.key,
       position: best?.position,
       move: move ? `${move.player}:${move.from}:${move.to}` : "",
+      moves: best?.moves || [],
       outlook: outlook.state,
       seeded: seededResult?.raw,
       mismatch: runtime.modelMismatch,
